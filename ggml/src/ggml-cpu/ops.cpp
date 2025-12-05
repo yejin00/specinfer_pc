@@ -358,8 +358,6 @@ static void ggml_compute_forward_dup_bf16(
         return;
     }
 
-    // TODO: add more special-case implementations for tensor shapes/strides that can benefit from memcpy
-
     if (ggml_is_contiguous(dst)) {
         if (nb00 == sizeof(ggml_bf16_t)) {
             if (dst->type == GGML_TYPE_BF16) {
@@ -675,12 +673,6 @@ static void ggml_compute_forward_dup_f32(
         ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
-    static int dup_f32_entry = 0;
-    if (dup_f32_entry < 100) {
-        fprintf(stderr, "ggml_compute_forward_dup_f32 ENTRY: dst->type=%d, src0->type=%d\n",
-                dst->type, src0->type);
-        dup_f32_entry++;
-    }
 
     GGML_ASSERT(ggml_nelements(dst) == ggml_nelements(src0));
 
@@ -754,265 +746,6 @@ static void ggml_compute_forward_dup_f32(
                         id += rs * (ne01 - ir1);
                     }
                 }
-            } else if (dst->type == GGML_TYPE_Q4_0_PC) {
-                // Per-dimension quantization with new layout: [scales][data]
-                
-                // Debug: print quantization info
-                // static int quant_count = 0;
-                // static int kcur_count = 0;
-                // bool is_kcur = (strstr(dst->name, "cache_k") != NULL || strstr(src0->name, "Kcur") != NULL);
-                // bool print_debug = (is_kcur && kcur_count < 10);  // Print first 10 KCUR quantizations
-                
-                // if (params->ith == 0 && print_debug) {
-                //     fprintf(stderr, "\n=== Q4_0_PC quantization #%d%s ===\n", quant_count, is_kcur ? " [KCUR!]" : "");
-                //     fprintf(stderr, "  dst->name='%s', src0->name='%s'\n", dst->name, src0->name);
-                //     fprintf(stderr, "  Shape: ne00=%ld (head_dim), ne01=%ld (n_heads), ne02=%ld (n_tokens), ne03=%ld\n",
-                //             ne00, ne01, ne02, ne03);
-                //     fprintf(stderr, "  n_dims=%ld, n_tokens=%ld\n", ne00 * ne01, ne02);
-                //     if (is_kcur) kcur_count++;
-                // }
-                
-                // CRITICAL: Barrier to ensure all threads are ready
-                ggml_barrier(params->threadpool);
-                
-                // IMPORTANT: Only thread 0 should do quantization to avoid race conditions
-                if (params->ith == 0) {
-                    // Debug: print first few source values (only if src0 is F32)
-                    // if (print_debug) {
-                    //     if (src0->type == GGML_TYPE_F32) {
-                    //         const float * test_src = (float *) src0->data;
-                    //         
-                    //         // Check for NaN
-                    //         int nan_count = 0;
-                    //         for (int i = 0; i < ne00 * ne01 * ne02 && i < 1000; i++) {
-                    //             if (std::isnan(test_src[i])) nan_count++;
-                    //         }
-                    //         
-                    //         fprintf(stderr, "  Input F32 samples (NaN count: %d/%ld):\n", nan_count, ne00 * ne01 * ne02);
-                    //         fprintf(stderr, "    Token 0: [0]=%.4f, [1]=%.4f, [127]=%.4f, [128]=%.4f\n",
-                    //                 test_src[0], test_src[1], test_src[127], test_src[128]);
-                    //         if (ne02 > 1) {
-                    //             int token1_offset = ne00 * ne01; // offset to second token
-                    //             fprintf(stderr, "    Token 1: [0]=%.4f, [1]=%.4f, [127]=%.4f, [128]=%.4f\n",
-                    //                     test_src[token1_offset], test_src[token1_offset+1], 
-                    //                     test_src[token1_offset+127], test_src[token1_offset+128]);
-                    //         }
-                    //     } else {
-                    //         fprintf(stderr, "  src0 type=%d (not F32!)\n", src0->type);
-                    //     }
-                    // }
-                    
-                    // Debug disabled: NaN scan of src0
-                    // int nan_count = 0;
-                    // int total_elements = ne00 * ne01 * ne02 * ne03;
-                    // for (int i = 0; i < total_elements && i < 10000; i++) {
-                    //     if (std::isnan(test_src[i])) {
-                    //         nan_count++;
-                    //         if (nan_count <= 5) {
-                    //             fprintf(stderr, "  NaN found at src0[%d]\n", i);
-                    //         }
-                    //     }
-                    // }
-                    // if (nan_count > 0) {
-                    //     fprintf(stderr, "  ERROR: src0 contains %d NaN values (checked %d elements)!\n",
-                    //             nan_count, std::min(total_elements, 10000));
-                    // }
-                    
-                    // Input shape: [head_dim, n_heads, n_tokens] or [n_embd, n_tokens]
-                    // We need to treat it as [n_embd, n_tokens] where n_embd = ne00 * ne01
-                    const int64_t n_dims = ne00 * ne01;  // head_dim * n_heads = n_embd
-                    const int64_t n_tokens = ne02;        // actual tokens
-                    
-                    // Load scales
-                    const char* scales_path = getenv("GGML_Q4_0_PC_SCALES_PATH");
-                    if (!scales_path) scales_path = "scales_k.bin";
-                    
-                    // Extract layer index from tensor name (e.g., "cache_k_l5" -> layer 5)
-                    int layer_idx = 0;
-                    if (dst->name && strstr(dst->name, "cache_k_l")) {
-                        sscanf(dst->name, "cache_k_l%d", &layer_idx);
-                    }
-                    
-                    std::ifstream f(scales_path, std::ios::binary);
-                    if (!f) GGML_ABORT("Failed to open scales file");
-                    
-                    // Seek to the correct layer's scales
-                    // Layout: [layer0_scales][layer1_scales]...[layer31_scales]
-                    f.seekg(layer_idx * n_dims * sizeof(float), std::ios::beg);
-                    
-                    std::vector<float> scales(n_dims);
-                    f.read(reinterpret_cast<char*>(scales.data()), n_dims * sizeof(float));
-                    if (!f) GGML_ABORT("Failed to read scales");
-                    
-                    // Debug: Check scale values
-                    // line 810-820 (수정)
-                    static int debug_scales_count = 0;
-                    if (debug_scales_count < 5) {  // 3 -> 5로 변경
-                        fprintf(stderr, "Q4_0_PC Quantization: layer=%d, n_tokens=%ld, is_generation=%s\n", 
-                                layer_idx, n_tokens, (n_tokens == 1) ? "YES" : "NO (prefill)");
-                        fprintf(stderr, "  first 3 scales: %.4f, %.4f, %.4f\n", 
-                                scales[0], scales[1], scales[2]);
-                        debug_scales_count++;
-                    }
-                    // Quantize
-                    // Note: i03 is batch, i02 is token index in the view
-                    for (int i03 = 0; i03 < ne03; i03++) {
-                        const float * src_base = (float *) ((char *) src0->data + i03*nb03);
-                        char * dst_base = (char *) dst->data + i03*nb3;
-                        
-                        // Get base tensor data pointer (not view!)
-                        const struct ggml_tensor * base_tensor = dst->view_src ? dst->view_src : dst;
-                        char * base_tensor_start = (char *) base_tensor->data + i03*nb3;
-                        
-                        // Write all scales first (once per batch) to BASE tensor
-                        for (int64_t dim = 0; dim < n_dims; dim++) {
-                            ggml_half scale_fp16 = GGML_FP32_TO_FP16(scales[dim]);
-                            ((ggml_half*)base_tensor_start)[dim] = scale_fp16;
-                        }
-                        
-                        // base_dst points to data section (after scales)
-                        const size_t scales_size_bytes = n_dims * sizeof(ggml_half);
-                        char * base_dst = base_tensor_start + scales_size_bytes;
-                        
-                        // Then write all data
-                        // CRITICAL: Each dim gets kv_size/2 bytes (not n_tokens/2!)
-                        // Get kv_size from the view_src (base tensor)
-                        // IMPORTANT: Write to BASE tensor, not view!
-                        // base_dst already points to data section, so use it directly
-                        uint8_t * base_data_ptr = (uint8_t*)base_dst;
-                        
-                        // Calculate view offset in tokens from view_offs
-                        // view_offs is in bytes from the start of base tensor
-                        // We need to convert it to token offset
-                        const size_t kv_size = base_tensor->ne[1];  // This should be 4096
-                        const size_t bytes_per_dim = kv_size / 2;
-                        
-                        // Calculate view offset in tokens by comparing data pointers
-                        // dst_base points to view's data, base_dst points to base tensor's data
-                        // Both already skip scales (8192 bytes), so the difference is the token offset in the data section
-                        const size_t view_data_offset_bytes = dst_base - base_dst;
-                        // Each dimension has bytes_per_dim bytes for all tokens
-                        // To get token offset: divide by (n_dims * bytes_per_token) where bytes_per_token = 0.5
-                        // Simplified: view_data_offset_bytes is in the data section
-                        // Layout: [dim0: bytes_per_dim][dim1: bytes_per_dim]...[dim_n: bytes_per_dim]
-                        // If view starts at token T, offset = T * 0.5 (for each dim)
-                        // But we have n_dims dimensions, so total offset = T * 0.5 (not * n_dims!)
-                        // Actually, the view's ne2 dimension tells us which tokens it covers
-                        // The offset in bytes / (bytes per token across all dims) = token offset
-                        // bytes per token across all dims = n_dims * 0.5
-                        const size_t bytes_per_token_all_dims = n_dims / 2;  // 4096 / 2 = 2048
-                        const size_t view_token_offset = view_data_offset_bytes / bytes_per_token_all_dims;
-                        
-                        // static int offset_debug = 0;
-                        // offset_debug++;
-                        // if (offset_debug <= 5) {
-                        //     fprintf(stderr, "Quantization #%d: offset_bytes=%zu, view_token_offset=%zu, n_tokens=%ld, ne02=%ld\n",
-                        //             offset_debug, view_data_offset_bytes, view_token_offset, n_tokens, ne02);
-                        //     fprintf(stderr, "  kv_size=%zu, bytes_per_dim=%zu\n", kv_size, bytes_per_dim);
-                        // }
-                        
-                        // CRITICAL: Initialize all data to 0 on first quantization (for unused tokens)
-                        // This ensures that dequantization of unused tokens returns 0
-                        // We use a map to track which BASE tensors have been initialized (not views!)
-                        static std::unordered_set<void*> initialized_tensors;
-                        void* base_data = base_tensor->data;
-                        if (initialized_tensors.find(base_data) == initialized_tensors.end()) {
-                            // Initialize the ENTIRE base tensor, not just the view!
-                            uint8_t * base_data_ptr = (uint8_t*)base_data + n_dims * sizeof(ggml_half);
-                            // fprintf(stderr, "  First quantization: base=%p, dst_base=%p, diff=%ld\n", 
-                            //         base_data, dst_base, (char*)dst_base - (char*)base_data);
-                            // fprintf(stderr, "  Initializing %zu bytes to 0 at offset %zu\n", 
-                            //         n_dims * bytes_per_dim, n_dims * sizeof(ggml_half));
-                            memset(base_data_ptr, 0, n_dims * bytes_per_dim);
-                            initialized_tensors.insert(base_data);
-                        }
-                        
-                        // Quantize dimension by dimension
-                        // Input layout: src[ne02][ne01][ne00] = src[n_tokens][n_heads][head_dim]
-                        // But we treat it as src[n_tokens][n_dims] where n_dims = ne00 * ne01
-                        for (int64_t dim = 0; dim < n_dims; dim++) {
-                            float scale = scales[dim];
-                            
-                            // Calculate offset for this dimension in BASE tensor
-                            uint8_t * dim_data = base_data_ptr + dim * bytes_per_dim;
-                            
-                            // Quantize all tokens for this dimension
-                            for (int64_t token = 0; token < n_tokens; token += 2) {
-                                // Write to base tensor at (view_token_offset + token)
-                                const size_t base_token_idx = view_token_offset + token;
-                                // Since input is [ne00, ne01, ne02], we need to access:
-                                // src[token][head][dim_in_head]
-                                // But we're treating it as src[token][dim] where dim = head * ne00 + dim_in_head
-                                const int64_t head = dim / ne00;
-                                const int64_t dim_in_head = dim % ne00;
-                                
-                                const float * src_ptr = (const float *)src_base;
-                                float v0 = src_ptr[token * nb02/sizeof(float) + head * nb01/sizeof(float) + dim_in_head];
-                                float v1 = 0.0f;
-                                if (token + 1 < n_tokens) {
-                                    v1 = src_ptr[(token + 1) * nb02/sizeof(float) + head * nb01/sizeof(float) + dim_in_head];
-                                }
-                                
-                                v0 /= scale;
-                                v1 /= scale;
-                                
-                                // Proper rounding for both positive and negative numbers
-                                int8_t q0 = (int8_t)roundf(v0);
-                                int8_t q1 = (int8_t)roundf(v1);
-                                
-                                // Clamp to 4-bit signed range: -7 to 7 (we use -8 for zero offset)
-                                q0 = (q0 < -7) ? -7 : (q0 > 7) ? 7 : q0;
-                                q1 = (q1 < -7) ? -7 : (q1 > 7) ? 7 : q1;
-                                
-                                // Pack: offset by 7 to get 0-14 range, store in 4-bit
-                                uint8_t packed = ((q0 + 7) & 0x0F) | (((q1 + 7) & 0x0F) << 4);
-                                dim_data[base_token_idx / 2] = packed;
-                            }
-                        }
-                        
-                        // Debug: verify quantization result
-                        static int quant_debug_count = 0; 
-                        if (quant_debug_count < 0 && i03 == 0) {
-                            const float * src_ptr = (const float *)src_base;
-                            const ggml_half * check_scales = (ggml_half*)base_tensor_start;
-                            const uint8_t * check_data = (uint8_t*)base_dst;
-                            
-                            fprintf(stderr, "\n=== Quantization verification ===\n");
-                            fprintf(stderr, "  view_token_offset=%zu, n_tokens=%ld\n", view_token_offset, n_tokens);
-                            fprintf(stderr, "  Original F32 values (first 2 tokens, dim 0):\n");
-                            fprintf(stderr, "    token 0: %.4f, token 1: %.4f\n", src_ptr[0], src_ptr[nb02/sizeof(float)]);
-                            
-                            fprintf(stderr, "  Scales (F32 vs FP16):\n");
-                            fprintf(stderr, "    scales[0]=%.4f, stored_fp16=%.4f\n", 
-                                    scales[0], GGML_FP16_TO_FP32(check_scales[0]));
-                            
-                            fprintf(stderr, "  Quantized data at base tensor:\n");
-                            fprintf(stderr, "    dim 0: data[%zu]=0x%02x\n", view_token_offset/2, check_data[view_token_offset/2]);
-                            fprintf(stderr, "    dim 1: data[%zu]=0x%02x\n", bytes_per_dim + view_token_offset/2, check_data[bytes_per_dim + view_token_offset/2]);
-                            fprintf(stderr, "    dim 2: data[%zu]=0x%02x\n", 2*bytes_per_dim + view_token_offset/2, check_data[2*bytes_per_dim + view_token_offset/2]);
-                            
-                            // Dequantize and compare
-                            uint8_t packed = check_data[view_token_offset/2];
-                            int8_t q0 = (int8_t)((packed & 0x0F) - 7);
-                            int8_t q1 = (int8_t)(((packed >> 4) & 0x0F) - 7);
-                            float dequant0 = q0 * scales[0];
-                            float dequant1 = q1 * scales[0];
-                            fprintf(stderr, "  Dequantized: token 0: %.4f (q=%d), token 1: %.4f (q=%d)\n", 
-                                    dequant0, q0, dequant1, q1);
-                            
-                            quant_debug_count++;
-                        }
-                    }
-                }
-                // CRITICAL: All threads must reach this barrier to ensure src0 is fully computed
-                // if (print_debug) {
-                //     fprintf(stderr, "  Quantization completed, calling barrier...\n");
-                // }
-                ggml_barrier(params->threadpool);
-                // if (print_debug) {
-                //     fprintf(stderr, "  Barrier passed, returning from quantization\n");
-                // }
-                return;
             } else if (ggml_get_type_traits_cpu(dst->type)->from_float) {
                 ggml_from_float_t const quantize_row_q = ggml_get_type_traits_cpu(dst->type)->from_float;
 
@@ -1037,30 +770,14 @@ static void ggml_compute_forward_dup_f32(
             }
         } else {
             //printf("%s: this is not optimal - fix me\n", __func__);
-
             if (dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16) {
                 if (src0->type == GGML_TYPE_Q4_0_PC) {
-                    // Per-dimension dequantization with [scales][data] layout
-                    // static int dequant_count = 0;
-                    // bool print_dequant = (dequant_count < 3);
-                    // if (print_dequant) {
-                    //     fprintf(stderr, "\n=== Q4_0_PC dequantization #%d ===\n", dequant_count);
-                    //     fprintf(stderr, "  src0->name='%s', dst->name='%s'\n", src0->name, dst->name);
-                    //     fprintf(stderr, "  Shape: ne00=%ld, ne01=%ld, ne02=%ld, ne03=%ld\n", ne00, ne01, ne02, ne03);
-                    //     fprintf(stderr, "  Strides: nb0=%ld, nb1=%ld, nb2=%ld, nb3=%ld\n", nb0, nb1, nb2, nb3);
-                    //     fprintf(stderr, "  src0 strides: nb00=%ld, nb01=%ld, nb02=%ld, nb03=%ld\n", nb00, nb01, nb02, nb03);
-                    //     fprintf(stderr, "  dst_type=%d (F32=%d, F16=%d)\n", dst->type, GGML_TYPE_F32, GGML_TYPE_F16);
-                    //     fprintf(stderr, "  src0->data=%p, dst->data=%p\n", src0->data, dst->data);
-                    //     dequant_count++;
-                    // }
+
                     
                     // Output shape should match input quantization: [head_dim, n_heads, n_tokens]
                     const int64_t n_dims = ne00 * ne01;  // head_dim * n_heads = n_embd
                     const int64_t n_tokens = ne02;        // actual tokens
-                    
-                    // if (print_dequant) {
-                    //     fprintf(stderr, "  Starting dequantization: n_dims=%ld, n_tokens=%ld\n", n_dims, n_tokens);
-                    // }
+
                     
                     for (int i03 = 0; i03 < ne03; i03++) {
                         const char * src_base = (char *) src0->data + i03*nb03;
@@ -1076,17 +793,6 @@ static void ggml_compute_forward_dup_f32(
                         // data_base points to the view's data (already offset past scales)
                         const uint8_t * data_base = (uint8_t*)src_base;
                         
-                        static int dequant_debug = 0;
-                        // if (dequant_debug < 3) {
-                        if (dequant_debug < 1 && i03==0){
-                            fprintf(stderr, "\n=== Dequantization #%d ===\n", dequant_debug);
-                            fprintf(stderr, "  First 3 scales: %.4f, %.4f, %.4f\n", 
-                                    GGML_FP16_TO_FP32(scales_ptr[0]),
-                                    GGML_FP16_TO_FP32(scales_ptr[1]),
-                                    GGML_FP16_TO_FP32(scales_ptr[2]));
-                            fprintf(stderr, "  n_dims=%ld, n_tokens=%ld, i03=%ld\n", n_dims, n_tokens, i03);
-                            dequant_debug++;
-                        }
                         
                         // Dequantize each dimension
                         for (int64_t dim = 0; dim < n_dims; dim++) {
@@ -1100,26 +806,6 @@ static void ggml_compute_forward_dup_f32(
                             // data[dim][token] layout: use nb01 for dim stride
                             const uint8_t * dim_data = data_base + (head * ne00 + dim_in_head) * nb01;
                             
-                            // Debug: print first few values
-                            static int debug_count = 0;
-                            // if (debug_count < 0 && i03 == 0 && dim < 3) {
-                            if (debug_count < 1 && i03   == 0 && dim < 3){
-                                fprintf(stderr, "  dim=%ld (head=%ld, dim_in_head=%ld), scale=%.4f\n",
-                                        dim, head, dim_in_head, scale);
-                                fprintf(stderr, "    dim_data offset=%ld, first byte: %02x\n",
-                                        dim_data - data_base, dim_data[0]);
-                                fprintf(stderr, "    nb01=%ld, expected offset for dim=%ld: %ld\n",
-                                        nb01, dim, dim * nb01);
-                                
-                                // Dequantize first token
-                                uint8_t packed = dim_data[0];
-                                int8_t q0 = (int8_t)((packed & 0x0F) - 7);
-                                int8_t q1 = (int8_t)(((packed >> 4) & 0x0F) - 7);
-                                fprintf(stderr, "    First token: q0=%d, q1=%d, dequant0=%.4f, dequant1=%.4f\n",
-                                        q0, q1, q0 * scale, q1 * scale);
-                                
-                                if (dim == 2) debug_count++;
-                            }
                             
                             // Dequantize all tokens for this dimension
                             for (int64_t token = 0; token < n_tokens; token += 2) {
@@ -1409,15 +1095,6 @@ static void ggml_compute_forward_dup_f32(
             f.read(reinterpret_cast<char*>(scales.data()), n_dims * sizeof(float));
             if (!f) GGML_ABORT("Failed to read scales");
             
-            // Debug
-            static int debug_scales_count_nc = 0;
-            if (debug_scales_count_nc < 50) {
-                fprintf(stderr, "Q4_0_PC Quantization (non-contiguous): layer=%d, n_tokens=%ld\n", 
-                        layer_idx, n_tokens);
-                fprintf(stderr, "  first 3 scales: %.4f, %.4f, %.4f\n", 
-                        scales[0], scales[1], scales[2]);
-                debug_scales_count_nc++;
-            }
             
             // Quantize - same logic as contiguous case
             for (int i03 = 0; i03 < ne03; i03++) {
@@ -1575,16 +1252,11 @@ extern "C" void quantize_q4_0_pc_immediate(
             fprintf(stderr, "  - Scaled Val    : %.6f (Src / Scale)\n", src_val * inv_scale);
             fprintf(stderr, "  - Expected Int4 : %d\n", expected_q);
 
-            // 4. 실제 메모리에 써진 값 확인 (나중에 루프 돌고 나서 확인해야 하지만, 로직상 여기서 미리 계산)
-            // 실제 메모리 포인터 계산
             uint8_t * dst_data_base = (uint8_t *)(base_tensor_data + n_dims * sizeof(ggml_half));
             uint8_t * dim_base_ptr = dst_data_base + (check_dim * (kv_size / 2));
             uint32_t cur_pos = head_cur + check_tok;
             size_t byte_idx = cur_pos / 2;
             bool high = (cur_pos % 2) != 0;
-            
-            // 아직 쓰기 전일 수 있으므로, 쓰기 로직을 수행한 '척' 하고 비교
-            // (하지만 실제 검증은 루프 끝나고 읽는 게 제일 정확함. 여기선 로직 검증)
             
             fprintf(stderr, "  -> Will write to byte_idx: %zu, high_nibble: %s\n", byte_idx, high ? "TRUE" : "FALSE");
             
@@ -1593,15 +1265,7 @@ extern "C" void quantize_q4_0_pc_immediate(
     }
 
 
-    // 2. Write scales to tensor header (always write, or only once? safe to overwrite)
-    // base_tensor_data structure: [scales(n_dims * 2 bytes)][quantized_data(n_dims * kv_size / 2 bytes)]
     ggml_half * dst_scales = (ggml_half *)base_tensor_data;
-    // memcpy(dst_scales, scales.data(), n_dims * sizeof(ggml_half)); 
-    // Optimization: only copy if first token? Or just copy always (fast enough).
-    // Let's copy always for safety for now, or check if needed.
-    // Actually, since we access this constantly, copying every token is redundant but safe.
-    // A better way: check if head_cur == 0. But we might come in mid-stream.
-    // Let's just do it. Memcpy 8KB is cheap.
     memcpy(dst_scales, scales.data(), n_dims * sizeof(ggml_half));
 
 
@@ -1651,7 +1315,7 @@ extern "C" void quantize_q4_0_pc_immediate(
                 dim_base_ptr[byte_idx] = (dim_base_ptr[byte_idx] & 0x0F) | (qu << 4);
             }
         }
-    }    // 함수 맨 끝 (루프 종료 후)
+    }    
     
     if (layer_idx == 0 && n_tokens == 1) { // Generation 1토큰일 때만 확인
         static int mem_check_count = 0;
@@ -1670,7 +1334,7 @@ extern "C" void quantize_q4_0_pc_immediate(
             int8_t stored_q = high ? (byte_val >> 4) : (byte_val & 0x0F);
             if (stored_q >= 8) stored_q -= 16; // 4bit sign extension (0..15 -> -8..7)
             // 주의: 위 sign extension은 2's complement가 아니라 offset binary라면 다름.
-            // 우리 로직: (q + 8) & 0x0F -> 즉 0~15로 저장됨.
+            // (q + 8) & 0x0F -> 즉 0~15로 저장됨.
             // 복원 로직: stored_val - 8
             
             int stored_int = (high ? (byte_val >> 4) : (byte_val & 0x0F));

@@ -831,61 +831,11 @@ ggml_tensor * llama_kv_cache_unified::cpy_k(ggml_context * ctx, ggml_tensor * k_
 
     const int64_t n_tokens = k_cur->ne[2];
     
-    // static int debug_all_cpy_k = 0;
-    // if (debug_all_cpy_k < 200) {
-    //     fprintf(stderr, "DEBUG cpy_k ENTRY: layer=%d, n_tokens=%ld, head_cur=%u, k->type=%d (Q4_0_PC=%d)\n",
-    //             il, n_tokens, head_cur, k->type, GGML_TYPE_Q4_0_PC);
-    //     debug_all_cpy_k++;
-    // }    
 
     // Set layer tag right before quantization
     ggml_quantize_q4_0_set_current_layer(il);
 
-    // if (k->type == GGML_TYPE_Q4_0_PC) {
-
-    //     static int debug_cpy_k_count = 0;
-    //     if (debug_cpy_k_count < 100) {
-    //         fprintf(stderr, "DEBUG cpy_k: layer=%d, n_tokens=%d, head_cur=%u, setting global\n",
-    //                 il, n_tokens, head_cur);
-    //         debug_cpy_k_count++;
-    //     }    
-
-    //     ggml_quantize_q4_0_set_head_cur(head_cur);
-
-    //     const size_t n_embd = hparams.n_embd_k_gqa(il);
-    //     const size_t head_dim = hparams.n_embd_head_k;
-    //     const size_t n_heads = hparams.n_head_kv(il);
-    //     const size_t kv_size = k->ne[1];
-        
-    //     // Offset: skip scales + head_cur offset in per-channel layout
-    //     const size_t scales_offset = n_embd * sizeof(ggml_fp16_t);
-        
-    //     // CRITICAL: In per-channel layout [dim][token], we need to offset by head_cur tokens
-    //     // Since each token is 0.5 bytes (4-bit), offset = head_cur / 2
-    //     const size_t token_offset_bytes = head_cur / 2;
-    //     const size_t data_offset = scales_offset + token_offset_bytes;
-        
-    //     // Use same stride calculation as get_k()
-    //     const size_t nb1 = kv_size / 2;
-    //     const size_t nb2 = head_dim * kv_size / 2;
-        
-    //     ggml_tensor * k_view = ggml_view_3d(ctx, k,
-    //             head_dim, n_heads, n_tokens,
-    //             nb1,
-    //             nb2,
-    //             data_offset);  // ← head_cur 반영!
-
-    //     // k_view->op_params[0] = head_cur;
-    //     // fprintf(stderr, "cpy_k: Creating ggml_cpy for layer=%d, head_cur=%u\n", il, head_cur);
-    //     ggml_tensor * result = ggml_cpy(ctx, k_cur, k_view);
-    //     // fprintf(stderr, "cpy_k: ggml_cpy created, result->op=%d\n", result->op);
-
-    //     return result;
-    // }
     if (k->type == GGML_TYPE_Q4_0_PC) {
-        if (n_tokens > 128) {
-            return k_cur; 
-        }
 
         // 파라미터 저장 (그래프 실행 때 쓰려고 힙에 할당)
         Q4_0_PC_Params * params = new Q4_0_PC_Params{
@@ -903,7 +853,6 @@ ggml_tensor * llama_kv_cache_unified::cpy_k(ggml_context * ctx, ggml_tensor * k_
         
         return dummy;
     }
-
 
     ggml_tensor * k_view = ggml_view_1d(ctx, k,
             n_tokens*hparams.n_embd_k_gqa(il),
