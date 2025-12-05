@@ -171,6 +171,13 @@ typedef struct {
 } block_q4_0;
 static_assert(sizeof(block_q4_0) == sizeof(ggml_half) + QK4_0 / 2, "wrong q4_0 block size/padding");
 
+// Per-channel Q4_0 for KV cache
+typedef struct {
+    ggml_half d;           // scale for this channel
+    uint8_t qs[1];         // nibbles / quants (actual size = seq_len/2, variable length array)
+} pc_q4_0;
+// Note: sizeof(pc_q4_0) is just the base size, actual size depends on seq_len
+
 #define QK4_1 32
 typedef struct {
     GGML_EXTENSION union {

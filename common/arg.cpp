@@ -822,6 +822,7 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_BF16,
     GGML_TYPE_Q8_0,
     GGML_TYPE_Q4_0,
+    GGML_TYPE_Q4_0_PC,  // Per-channel Q4_0 for KV cache
     GGML_TYPE_Q4_1,
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
@@ -2109,6 +2110,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_type_v = kv_cache_type_from_str(value);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
+    add_opt(common_arg(
+        {"--cache-type-k-scales"}, "PATH",
+        "path to per-channel scales file for Q4_0_PC quantization (e.g., scales_k.bin)\n"
+        "required when using --cache-type-k q4_0_pc",
+        [](common_params & params, const std::string & value) {
+            params.cache_type_k_scales_path = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_TYPE_K_SCALES"));
     add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",

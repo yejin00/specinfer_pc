@@ -907,6 +907,11 @@ struct common_init_result common_init_from_params(common_params & params) {
 
     auto cparams = common_context_params_to_llama(params);
 
+    // Set environment variable for per-channel scales path if specified
+    if (!params.cache_type_k_scales_path.empty()) {
+        setenv("GGML_Q4_0_PC_SCALES_PATH", params.cache_type_k_scales_path.c_str(), 1);
+    }
+
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         LOG_ERR("%s: failed to create context with model '%s'\n", __func__, params.model.path.c_str());
@@ -1154,6 +1159,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
+    cparams.type_k_scales_path = params.cache_type_k_scales_path.empty() ? nullptr : params.cache_type_k_scales_path.c_str();
 
     return cparams;
 }

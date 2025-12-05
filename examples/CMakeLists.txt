@@ -19,6 +19,7 @@ else()
     add_subdirectory(eval-callback)
 
     add_subdirectory(gguf-hash)
+    add_subdirectory(kv-cache-scale-stats)
     add_subdirectory(gguf)
     add_subdirectory(gritlm)
     add_subdirectory(lookahead)

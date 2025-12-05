@@ -6324,9 +6324,9 @@ class LazyTorchTensor(gguf.LazyBase):
         "I16": torch.int16,
         "U8": torch.uint8,
         "I8": torch.int8,
-        "BOOL": torch.bool,
-        "F8_E4M3": torch.float8_e4m3fn,
-        "F8_E5M2": torch.float8_e5m2,
+        "BOOL": torch.bool
+        # "F8_E4M3": torch.float8_e4m3fn,
+        # "F8_E5M2": torch.float8_e5m2,
     }
 
     def numpy(self) -> gguf.LazyNumpyTensor:

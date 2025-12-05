@@ -1359,7 +1359,27 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     struct ggml_backend_sched_split * splits = sched->splits;
-
+    
+    // Debug: Print Q4_0_PC related nodes in each split
+    // static int debug_count = 0;
+    // if (debug_count < 3) {
+    //     fprintf(stderr, "\n=== Graph Splits (n_splits=%d) ===\n", sched->n_splits);
+    //     for (int i = 0; i < sched->n_splits; i++) {
+    //         int kcur_count = 0, cpy_pc_count = 0;
+    //         for (int j = 0; j < splits[i].graph.n_nodes; j++) {
+    //             struct ggml_tensor * node = splits[i].graph.nodes[j];
+    //             if (strncmp(node->name, "Kcur-", 5) == 0) kcur_count++;
+    //             if (node->op == GGML_OP_CPY && node->type == GGML_TYPE_Q4_0_PC) cpy_pc_count++;
+    //         }
+    //         if (kcur_count > 0 || cpy_pc_count > 0) {
+    //             fprintf(stderr, "Split %d (backend=%d): %d Kcur nodes, %d Q4_0_PC CPY nodes\n",
+    //                     i, splits[i].backend_id, kcur_count, cpy_pc_count);
+    //         }
+    //     }
+    //     fprintf(stderr, "===================================\n\n");
+    //     debug_count++;
+    // }
+    
     for (int i = 0; i < sched->n_splits; i++) {
         struct ggml_backend_sched_split * split = &splits[i];
         int split_backend_id = split->backend_id;

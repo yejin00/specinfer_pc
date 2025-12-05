@@ -278,6 +278,8 @@ struct ggml_backend_opencl_context {
     cl_program program_add;
     cl_program program_clamp;
     cl_program program_cpy;
+    cl_program program_cpy_q4_0;
+    cl_program program_quantize_pc;
     cl_program program_cvt;
     cl_program program_diag_mask_inf;
     cl_program program_gelu;
@@ -344,6 +346,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_rope_norm_f32, kernel_rope_norm_f16, kernel_rope_neox_f32, kernel_rope_neox_f16;
     cl_kernel kernel_rope_multi_f32, kernel_rope_multi_f16, kernel_rope_vision_f32, kernel_rope_vision_f16;
     cl_kernel kernel_cpy_f16_f16, kernel_cpy_f16_f32, kernel_cpy_f32_f16, kernel_cpy_f32_f32;
+    cl_kernel kernel_cpy_f32_q4_0, kernel_cpy_q4_0_f32;
+    cl_kernel kernel_quantize_per_channel_q4_0, kernel_dequantize_per_channel_q4_0;
     cl_kernel kernel_mul_mat_f32_f32;
     cl_kernel kernel_mul_mat_f16_f16;
     cl_kernel kernel_mul_mat_f16_f32_1row;
@@ -368,6 +372,11 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_concat_f32_non_contiguous;
     cl_kernel kernel_timestep_embedding;
     cl_kernel kernel_mul_mv_id_q4_0_f32_8x_flat;
+
+    // Per-channel quantization scales
+    std::vector<float> pc_scales_k;  // Calibration scales for K cache
+    cl_mem pc_scales_k_buffer = nullptr;  // GPU buffer for scales
+    bool pc_scales_loaded = false;
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     // Transpose kernels
@@ -478,6 +487,91 @@ static cl_program build_program_from_source(cl_context ctx, cl_device_id dev, co
     return p;
 }
 
+//------------------------------------------------------------------------------
+// Per-channel Q4_0 CPU fallback functions
+//------------------------------------------------------------------------------
+
+// Load per-channel scales from binary file
+static std::vector<float> load_per_channel_scales(const char* path, int expected_size) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        GGML_LOG_ERROR("ggml_opencl: Cannot open scales file: %s\n", path);
+        return std::vector<float>();
+    }
+    
+    // Get file size
+    f.seekg(0, std::ios::end);
+    size_t file_size = f.tellg();
+    f.seekg(0, std::ios::beg);
+    
+    size_t expected_bytes = expected_size * sizeof(float);
+    if (file_size != expected_bytes) {
+        GGML_LOG_ERROR("ggml_opencl: Scales file size mismatch. Expected %zu bytes, got %zu bytes\n", 
+                       expected_bytes, file_size);
+        return std::vector<float>();
+    }
+    
+    std::vector<float> scales(expected_size);
+    f.read(reinterpret_cast<char*>(scales.data()), expected_bytes);
+    
+    if (!f) {
+        GGML_LOG_ERROR("ggml_opencl: Failed to read scales file\n");
+        return std::vector<float>();
+    }
+    
+    GGML_LOG_INFO("ggml_opencl: Loaded %d per-channel scales from %s\n", expected_size, path);
+    return scales;
+}
+
+static void quantize_per_channel_q4_0_cpu(
+    const float* src,      // [n_embd, kv_size]
+    const float* scales,   // [n_embd]
+    uint8_t* dst,          // output
+    int n_embd,
+    int kv_size
+) {
+    for (int ch = 0; ch < n_embd; ch++) {
+        float scale = scales[ch];
+        float inv_scale = (scale != 0.0f) ? (1.0f / scale) : 0.0f;
+        
+        for (int i = 0; i < kv_size / 2; i++) {
+            float v0 = src[ch * kv_size + i * 2];
+            float v1 = src[ch * kv_size + i * 2 + 1];
+            
+            int q0 = (int)(v0 * inv_scale + 8.5f);
+            int q1 = (int)(v1 * inv_scale + 8.5f);
+            
+            // Clamp to [0, 15]
+            q0 = q0 < 0 ? 0 : (q0 > 15 ? 15 : q0);
+            q1 = q1 < 0 ? 0 : (q1 > 15 ? 15 : q1);
+            
+            dst[ch * (kv_size / 2) + i] = (uint8_t)(q0 | (q1 << 4));
+        }
+    }
+}
+
+static void dequantize_per_channel_q4_0_cpu(
+    const uint8_t* src,
+    const float* scales,
+    float* dst,
+    int n_embd,
+    int kv_size
+) {
+    for (int ch = 0; ch < n_embd; ch++) {
+        float scale = scales[ch];
+        
+        for (int i = 0; i < kv_size / 2; i++) {
+            uint8_t packed = src[ch * (kv_size / 2) + i];
+            
+            int q0 = (packed & 0x0F) - 8;
+            int q1 = (packed >> 4) - 8;
+            
+            dst[ch * kv_size + i * 2] = (float)q0 * scale;
+            dst[ch * kv_size + i * 2 + 1] = (float)q1 * scale;
+        }
+    }
+}
+
 static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_version opencl_c_version) {
     cl_int err;
 
@@ -541,6 +635,29 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         CL_CHECK((backend_ctx->kernel_cpy_f32_f32 = clCreateKernel(backend_ctx->program_cpy, "kernel_cpy_f32_f32", &err), err));
         GGML_LOG_CONT(".");
     }
+
+    // cpy_q4_0
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "cpy_q4_0.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("cpy_q4_0.cl");
+#endif
+        backend_ctx->program_cpy_q4_0 =
+            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
+
+        CL_CHECK((backend_ctx->kernel_cpy_f32_q4_0 = clCreateKernel(backend_ctx->program_cpy_q4_0, "kernel_cpy_f32_q4_0", &err), err));
+        CL_CHECK((backend_ctx->kernel_cpy_q4_0_f32 = clCreateKernel(backend_ctx->program_cpy_q4_0, "kernel_cpy_q4_0_f32", &err), err));
+        GGML_LOG_CONT(".");
+    }
+
+    // quantize_pc (per-channel quantization) - Optional, will use CPU fallback if not available
+    // TODO: Implement OpenCL kernels for per-channel quantization
+    // For now, we use CPU fallback in ggml_cl_cpy()
+    backend_ctx->kernel_quantize_per_channel_q4_0 = nullptr;
+    backend_ctx->kernel_dequantize_per_channel_q4_0 = nullptr;
 
     // cvt
     {
@@ -1684,9 +1801,9 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     } else if (strstr(dev_ctx->device_name.c_str(), "Intel")) {
         backend_ctx->gpu_family = GPU_FAMILY::INTEL;
     } else {
-        GGML_LOG_ERROR("Unsupported GPU: %s\n", dev_ctx->device_name.c_str());
+        GGML_LOG_WARN("Unsupported GPU: %s - will use CPU fallback for operations\n", dev_ctx->device_name.c_str());
         backend_ctx->gpu_family = GPU_FAMILY::UNKNOWN;
-        return nullptr;
+        // Don't return nullptr - allow CPU fallback
     }
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
@@ -1809,10 +1926,34 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     // Load kernels
     load_cl_kernels(backend_ctx.get(), opencl_c_version);
 
+    // Load per-channel quantization scales for K cache
+    const char* scales_path = getenv("GGML_Q4_0_PC_SCALES_PATH");
+    if (scales_path == nullptr) {
+        scales_path = "scales_k.bin";  // Default path
+    }
+    
+    // Try to load scales (optional, will warn if not found)
+    backend_ctx->pc_scales_k = load_per_channel_scales(scales_path, 4096);  // Assuming 4096 channels
+    if (!backend_ctx->pc_scales_k.empty()) {
+        backend_ctx->pc_scales_loaded = true;
+        
+        // Upload scales to GPU constant memory
+        size_t scales_size = backend_ctx->pc_scales_k.size() * sizeof(float);
+        CL_CHECK((backend_ctx->pc_scales_k_buffer = clCreateBuffer(
+            context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, 
+            scales_size, backend_ctx->pc_scales_k.data(), &err), err));
+        
+        GGML_LOG_INFO("ggml_opencl: Per-channel scales uploaded to GPU (%zu bytes)\n", scales_size);
+    } else {
+        GGML_LOG_WARN("ggml_opencl: Per-channel scales not loaded, per-channel quantization disabled\n");
+        backend_ctx->pc_scales_loaded = false;
+    }
+
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     // Allocate intermediate buffers and images
     size_t required_A_q_d_bytes = 311164928;
     size_t required_A_s_d_bytes = 38895616;
+    
     size_t required_B_d_bytes = 45088768;
 
     // Ensure buffer sizes do not exceed the maximum allocation size
@@ -2131,6 +2272,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     switch (op->type) {
                         case GGML_TYPE_F16:
                         case GGML_TYPE_F32:
+                        case GGML_TYPE_Q4_0:
                             return true;
                         default:
                             return false;
@@ -2138,6 +2280,13 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 case GGML_TYPE_F16:
                     switch (op->type) {
                         case GGML_TYPE_F16:
+                        case GGML_TYPE_F32:
+                            return true;
+                        default:
+                            return false;
+                    }
+                case GGML_TYPE_Q4_0:
+                    switch (op->type) {
                         case GGML_TYPE_F32:
                             return true;
                         default:
@@ -5794,6 +5943,58 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const 
                 case GGML_TYPE_F32:
                     kernel = backend_ctx->kernel_cpy_f32_f32;
                     break;
+                case GGML_TYPE_Q4_0:
+                    kernel = backend_ctx->kernel_cpy_f32_q4_0;
+                    GGML_LOG_INFO("=== F32->Q4_0 CPY ===\n");
+                    GGML_LOG_INFO("src0 (F32): ne=[%d,%d,%d,%d] nb=[%zu,%zu,%zu,%zu]\n", 
+                        ne00, ne01, ne02, ne03, nb00, nb01, nb02, nb03);
+                    GGML_LOG_INFO("src1 (Q4_0): ne=[%d,%d,%d,%d] nb=[%zu,%zu,%zu,%zu]\n", 
+                        ne10, ne11, ne12, ne13, nb10, nb11, nb12, nb13);
+                    GGML_LOG_INFO("src0 type_size=%zu, src1 type_size=%zu\n",
+                        ggml_type_size(src0->type), ggml_type_size(src1->type));
+                    GGML_LOG_INFO("Total elements: %d, Total blocks: %d\n",
+                        ne00*ne01*ne02*ne03, (ne00*ne01*ne02*ne03)/32);
+                    break;
+                case GGML_TYPE_Q4_0_PC:
+                    // Per-channel Q4_0 quantization - CPU fallback
+                    GGML_LOG_INFO("=== F32->Q4_0_PC CPY (CPU fallback) ===\n");
+                    GGML_LOG_INFO("src0 (F32): ne=[%d,%d,%d,%d]\n", ne00, ne01, ne02, ne03);
+                    GGML_LOG_INFO("src1 (Q4_0_PC): ne=[%d,%d,%d,%d]\n", ne10, ne11, ne12, ne13);
+                    
+                    if (!backend_ctx->pc_scales_loaded) {
+                        GGML_LOG_ERROR("Per-channel scales not loaded! Cannot quantize to Q4_0_PC\n");
+                        GGML_ASSERT(false && "scales_k.bin must be loaded for Q4_0_PC");
+                    }
+                    
+                    // CPU fallback: copy data to host, quantize, copy back
+                    {
+                        const size_t src_size = ggml_nbytes(src0);
+                        const size_t dst_size = ggml_nbytes(src1);
+                        
+                        std::vector<float> src_host(ggml_nelements(src0));
+                        std::vector<uint8_t> dst_host(dst_size);
+                        
+                        // Download src from GPU
+                        CL_CHECK(clEnqueueReadBuffer(queue, extra0->data_device, CL_TRUE,
+                            offset0, src_size, src_host.data(), 0, NULL, NULL));
+                        
+                        // CPU quantization
+                        quantize_per_channel_q4_0_cpu(
+                            src_host.data(),
+                            backend_ctx->pc_scales_k.data(),
+                            dst_host.data(),
+                            ne01,  // n_embd (channels)
+                            ne00   // kv_size (sequence length)
+                        );
+                        
+                        // Upload dst to GPU
+                        CL_CHECK(clEnqueueWriteBuffer(queue, extra1->data_device, CL_TRUE,
+                            offset1, dst_size, dst_host.data(), 0, NULL, NULL));
+                        
+                        GGML_LOG_INFO("CPU fallback quantization completed\n");
+                        return;  // Skip kernel execution
+                    }
+                    break;
                 default:
                     GGML_ASSERT(false && "not implemented");
             }
@@ -5805,6 +6006,68 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const 
                     break;
                 case GGML_TYPE_F32:
                     kernel = backend_ctx->kernel_cpy_f16_f32;
+                    break;
+                default:
+                    GGML_ASSERT(false && "not implemented");
+            }
+            break;
+        case GGML_TYPE_Q4_0:
+            switch (src1t) {
+                case GGML_TYPE_F32:
+                    kernel = backend_ctx->kernel_cpy_q4_0_f32;
+                    GGML_LOG_INFO("=== Q4_0->F32 CPY ===\n");
+                    GGML_LOG_INFO("src0 (Q4_0): ne=[%d,%d,%d,%d] nb=[%zu,%zu,%zu,%zu]\n", 
+                        ne00, ne01, ne02, ne03, nb00, nb01, nb02, nb03);
+                    GGML_LOG_INFO("src1 (F32): ne=[%d,%d,%d,%d] nb=[%zu,%zu,%zu,%zu]\n", 
+                        ne10, ne11, ne12, ne13, nb10, nb11, nb12, nb13);
+                    GGML_LOG_INFO("src0 type_size=%zu, src1 type_size=%zu\n",
+                        ggml_type_size(src0->type), ggml_type_size(src1->type));
+                    break;
+                default:
+                    GGML_ASSERT(false && "not implemented");
+            }
+            break;
+        case GGML_TYPE_Q4_0_PC:
+            switch (src1t) {
+                case GGML_TYPE_F32:
+                    // Per-channel Q4_0 dequantization - CPU fallback
+                    GGML_LOG_INFO("=== Q4_0_PC->F32 CPY (CPU fallback) ===\n");
+                    GGML_LOG_INFO("src0 (Q4_0_PC): ne=[%d,%d,%d,%d]\n", ne00, ne01, ne02, ne03);
+                    GGML_LOG_INFO("src1 (F32): ne=[%d,%d,%d,%d]\n", ne10, ne11, ne12, ne13);
+                    
+                    if (!backend_ctx->pc_scales_loaded) {
+                        GGML_LOG_ERROR("Per-channel scales not loaded! Cannot dequantize Q4_0_PC\n");
+                        GGML_ASSERT(false && "scales_k.bin must be loaded for Q4_0_PC");
+                    }
+                    
+                    // CPU fallback: copy data to host, dequantize, copy back
+                    {
+                        const size_t src_size = ggml_nbytes(src0);
+                        const size_t dst_size = ggml_nbytes(src1);
+                        
+                        std::vector<uint8_t> src_host(src_size);
+                        std::vector<float> dst_host(ggml_nelements(src1));
+                        
+                        // Download src from GPU
+                        CL_CHECK(clEnqueueReadBuffer(queue, extra0->data_device, CL_TRUE,
+                            offset0, src_size, src_host.data(), 0, NULL, NULL));
+                        
+                        // CPU dequantization
+                        dequantize_per_channel_q4_0_cpu(
+                            src_host.data(),
+                            backend_ctx->pc_scales_k.data(),
+                            dst_host.data(),
+                            ne01,  // n_embd (channels)
+                            ne00   // kv_size (sequence length)
+                        );
+                        
+                        // Upload dst to GPU
+                        CL_CHECK(clEnqueueWriteBuffer(queue, extra1->data_device, CL_TRUE,
+                            offset1, dst_size, dst_host.data(), 0, NULL, NULL));
+                        
+                        GGML_LOG_INFO("CPU fallback dequantization completed\n");
+                        return;  // Skip kernel execution
+                    }
                     break;
                 default:
                     GGML_ASSERT(false && "not implemented");
@@ -5839,6 +6102,12 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const 
 
     size_t global_work_size[] = {(size_t)ne01*nth, (size_t)ne02, (size_t)ne03};
     size_t local_work_size[] = {(size_t)nth, 1, 1};
+
+    if (src0t == GGML_TYPE_F32 && src1t == GGML_TYPE_Q4_0) {
+        GGML_LOG_INFO("Work-group config: global=[%zu,%zu,%zu] local=[%zu,%zu,%zu]\n",
+            global_work_size[0], global_work_size[1], global_work_size[2],
+            local_work_size[0], local_work_size[1], local_work_size[2]);
+    }
 
 #ifdef GGML_OPENCL_PROFILING
     cl_event evt;

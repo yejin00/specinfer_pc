@@ -12,6 +12,35 @@
 #include <map>
 #include <stdexcept>
 
+extern "C" void ggml_quantize_q4_0_set_head_cur(uint32_t head_cur);
+extern "C" void quantize_q4_0_pc_immediate(
+    const float * src_data,      // k_cur->data
+    char * base_tensor_data,     // k->data
+    int64_t n_dims,              // n_embd_k_gqa(il)
+    int64_t n_tokens,            // n_tokens
+    uint32_t head_cur,           // head_cur
+    int layer_idx,               // il
+    size_t kv_size,              // k->ne[1]
+    const char * scales_path     // "scales_k.bin"
+);
+
+struct Q4_0_PC_Params {
+    int64_t n_dims;
+    int64_t n_tokens;
+    uint32_t head_cur;
+    int layer_idx;
+    size_t kv_size;
+    char * k_data;
+};
+
+extern "C" void custom_q4_0_pc_op(
+    struct ggml_tensor * dst,
+    const struct ggml_tensor * src,
+    int ith,
+    int nth,
+    void * userdata
+);
+
 //
 // llama_kv_cache_unified
 //
@@ -107,6 +136,7 @@ llama_kv_cache_unified::llama_kv_cache_unified(
         auto * buft = it.first;
         auto * ctx  = it.second;
 
+        //각 텐서에 physical memory 할당 k->data >[8KB scales][8MB data]
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for kv cache");
@@ -721,6 +751,45 @@ ggml_tensor * llama_kv_cache_unified::get_k(ggml_context * ctx, int32_t il, uint
 
     auto * k = layers[ikv].k;
 
+    // Special handling for Q4_0_PC with [scales][data] layout
+    if (k->type == GGML_TYPE_Q4_0_PC) {
+        // Memory layout: [all scales][all data]
+        // Data layout: data[dim][token] where dim = head * head_dim + dim_in_head
+        // 
+        // Per-channel quantization stores:
+        //   - All tokens for dim 0
+        //   - All tokens for dim 1
+        //   - ...
+        //   - All tokens for dim 4095
+        //
+        // To access [head_dim, n_heads, n_tokens], we need:
+        //   data[head * head_dim + dim_in_head][token]
+        
+        const size_t n_embd = hparams.n_embd_k_gqa(il);  // 4096
+        const size_t head_dim = hparams.n_embd_head_k;    // 128
+        const size_t n_heads = hparams.n_head_kv(il);     // 32
+        const size_t kv_size = k->ne[1];                  // max tokens (e.g., 4096)
+        
+        // Offset: skip scales section to start at data
+        const size_t scales_offset = n_embd * sizeof(ggml_fp16_t);  // 8192 bytes
+        
+        // Strides within the data section (4-bit packed)
+        // Per-channel layout: data[dim][token]
+        // nb0 = 1 (nibble, set by ggml_view_3d)
+        // nb1 = kv_size / 2 (to go to next dim within same head, skip all tokens)
+        // nb2 = head_dim * kv_size / 2 (to go to next head, skip head_dim * kv_size)
+        const size_t nb1 = kv_size / 2;           // stride between dims (all tokens)
+        const size_t nb2 = head_dim * kv_size / 2; // stride between heads
+        
+        return ggml_view_3d(ctx, k,
+                head_dim,           // ne0: 128
+                n_heads,            // ne1: 32
+                n_kv,               // ne2: n_kv tokens
+                nb1,                // nb1: stride to next dim (skip all tokens)
+                nb2,                // nb2: stride to next head
+                scales_offset);     // offset: skip scales
+    }
+    
     return ggml_view_3d(ctx, k,
             hparams.n_embd_head_k, hparams.n_head_kv(il), n_kv,
             ggml_row_size(k->type, hparams.n_embd_head_k),
@@ -750,12 +819,91 @@ ggml_tensor * llama_kv_cache_unified::get_v(ggml_context * ctx, int32_t il, uint
             0);
 }
 
+// for Q4_0 stats layer tagging
+extern "C" {
+    void ggml_quantize_q4_0_set_current_layer(int il);
+}
+
 ggml_tensor * llama_kv_cache_unified::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, int32_t il, uint32_t head_cur) const {
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * k = layers[ikv].k;
 
     const int64_t n_tokens = k_cur->ne[2];
+    
+    // static int debug_all_cpy_k = 0;
+    // if (debug_all_cpy_k < 200) {
+    //     fprintf(stderr, "DEBUG cpy_k ENTRY: layer=%d, n_tokens=%ld, head_cur=%u, k->type=%d (Q4_0_PC=%d)\n",
+    //             il, n_tokens, head_cur, k->type, GGML_TYPE_Q4_0_PC);
+    //     debug_all_cpy_k++;
+    // }    
+
+    // Set layer tag right before quantization
+    ggml_quantize_q4_0_set_current_layer(il);
+
+    // if (k->type == GGML_TYPE_Q4_0_PC) {
+
+    //     static int debug_cpy_k_count = 0;
+    //     if (debug_cpy_k_count < 100) {
+    //         fprintf(stderr, "DEBUG cpy_k: layer=%d, n_tokens=%d, head_cur=%u, setting global\n",
+    //                 il, n_tokens, head_cur);
+    //         debug_cpy_k_count++;
+    //     }    
+
+    //     ggml_quantize_q4_0_set_head_cur(head_cur);
+
+    //     const size_t n_embd = hparams.n_embd_k_gqa(il);
+    //     const size_t head_dim = hparams.n_embd_head_k;
+    //     const size_t n_heads = hparams.n_head_kv(il);
+    //     const size_t kv_size = k->ne[1];
+        
+    //     // Offset: skip scales + head_cur offset in per-channel layout
+    //     const size_t scales_offset = n_embd * sizeof(ggml_fp16_t);
+        
+    //     // CRITICAL: In per-channel layout [dim][token], we need to offset by head_cur tokens
+    //     // Since each token is 0.5 bytes (4-bit), offset = head_cur / 2
+    //     const size_t token_offset_bytes = head_cur / 2;
+    //     const size_t data_offset = scales_offset + token_offset_bytes;
+        
+    //     // Use same stride calculation as get_k()
+    //     const size_t nb1 = kv_size / 2;
+    //     const size_t nb2 = head_dim * kv_size / 2;
+        
+    //     ggml_tensor * k_view = ggml_view_3d(ctx, k,
+    //             head_dim, n_heads, n_tokens,
+    //             nb1,
+    //             nb2,
+    //             data_offset);  // ← head_cur 반영!
+
+    //     // k_view->op_params[0] = head_cur;
+    //     // fprintf(stderr, "cpy_k: Creating ggml_cpy for layer=%d, head_cur=%u\n", il, head_cur);
+    //     ggml_tensor * result = ggml_cpy(ctx, k_cur, k_view);
+    //     // fprintf(stderr, "cpy_k: ggml_cpy created, result->op=%d\n", result->op);
+
+    //     return result;
+    // }
+    if (k->type == GGML_TYPE_Q4_0_PC) {
+        if (n_tokens > 128) {
+            return k_cur; 
+        }
+
+        // 파라미터 저장 (그래프 실행 때 쓰려고 힙에 할당)
+        Q4_0_PC_Params * params = new Q4_0_PC_Params{
+            (int64_t)hparams.n_embd_k_gqa(il),
+            (int64_t)n_tokens,
+            head_cur,
+            il,
+            k->ne[1],
+            (char *)k->data
+        };
+
+        ggml_tensor * dummy = ggml_map_custom1(ctx, k_cur, custom_q4_0_pc_op, 1, params);
+        
+        ggml_format_name(dummy, "q4_0_pc_op_L%d", il);
+        
+        return dummy;
+    }
+
 
     ggml_tensor * k_view = ggml_view_1d(ctx, k,
             n_tokens*hparams.n_embd_k_gqa(il),
@@ -1023,12 +1171,25 @@ llm_graph_result_ptr llama_kv_cache_unified::build_graph_shift(
 
         ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
 
-        ggml_tensor * k =
-            ggml_view_3d(ctx, layer.k,
+        ggml_tensor * k;
+        if (layer.k->type == GGML_TYPE_Q4_0_PC) {
+            // Q4_0_PC special handling
+            const size_t scales_offset = n_embd_k_gqa * sizeof(ggml_fp16_t);
+            const size_t bytes_per_head = n_embd_head_k / 2;
+            const size_t bytes_per_token = n_embd_k_gqa / 2;
+            
+            k = ggml_view_3d(ctx, layer.k,
+                n_embd_head_k, n_head_kv, cells.size(),
+                bytes_per_head,
+                bytes_per_token,
+                scales_offset);
+        } else {
+            k = ggml_view_3d(ctx, layer.k,
                 n_embd_head_k, n_head_kv, cells.size(),
                 ggml_row_size(layer.k->type, n_embd_head_k),
                 ggml_row_size(layer.k->type, n_embd_k_gqa),
                 0);
+        }
 
         ggml_tensor * cur = build_rope_shift(cparams, ctx, k, inp->k_shift, rope_factors, freq_base_l, freq_scale_l);
 

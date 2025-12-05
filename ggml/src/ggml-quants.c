@@ -21,7 +21,76 @@
 
 #define UNUSED GGML_UNUSED
 
-// reference implementation for deterministic creation of model files
+// Statistics tracking for Q4_0 blocks
+static struct {
+    bool enabled;
+    int64_t block_count;
+    int64_t print_interval;
+} q4_0_block_stats = {false, 0, 1};
+
+// current layer tag for logging (set by higher-level code)
+static int q4_0_current_layer = -1;
+
+void ggml_quantize_q4_0_enable_scale_stats(bool enable) {
+    q4_0_block_stats.enabled = enable;
+    if (enable) {
+        q4_0_block_stats.block_count = 0;
+        fprintf(stderr, "[Q4_0 Block Stats] Enabled - will print min/max/mean/variance for each block (32 elements)\n");
+    }
+}
+
+void ggml_quantize_q4_0_print_scale_stats(void) {
+    fprintf(stderr, "[Q4_0 Block Stats] Total blocks processed: %ld\n", q4_0_block_stats.block_count);
+}
+
+void ggml_quantize_q4_0_reset_scale_stats(void) {
+    q4_0_block_stats.block_count = 0;
+    fprintf(stderr, "[Q4_0 Block Stats] Reset - starting fresh count for KV cache\n");
+}
+
+void ggml_quantize_q4_0_set_current_layer(int il) {
+    q4_0_current_layer = il;
+}
+
+// ORIGINAL: reference implementation for deterministic creation of model files
+// void quantize_row_q4_0_ref(const float * GGML_RESTRICT x, block_q4_0 * GGML_RESTRICT y, int64_t k) {
+//     static const int qk = QK4_0;
+// 
+//     assert(k % qk == 0);
+// 
+//     const int nb = k / qk;
+// 
+//     for (int i = 0; i < nb; i++) {
+//         float amax = 0.0f; // absolute max
+//         float max  = 0.0f;
+// 
+//         for (int j = 0; j < qk; j++) {
+//             const float v = x[i*qk + j];
+//             if (amax < fabsf(v)) {
+//                 amax = fabsf(v);
+//                 max  = v;
+//             }
+//         }
+// 
+//         const float d  = max / -8;
+//         const float id = d ? 1.0f/d : 0.0f;
+// 
+//         y[i].d = GGML_FP32_TO_FP16(d);
+// 
+//         for (int j = 0; j < qk/2; ++j) {
+//             const float x0 = x[i*qk + 0    + j]*id;
+//             const float x1 = x[i*qk + qk/2 + j]*id;
+// 
+//             const uint8_t xi0 = MIN(15, (int8_t)(x0 + 8.5f));
+//             const uint8_t xi1 = MIN(15, (int8_t)(x1 + 8.5f));
+// 
+//             y[i].qs[j]  = xi0;
+//             y[i].qs[j] |= xi1 << 4;
+//         }
+//     }
+// }
+
+// NEW: reference implementation with per-block statistics tracking
 void quantize_row_q4_0_ref(const float * GGML_RESTRICT x, block_q4_0 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK4_0;
 
@@ -32,6 +101,9 @@ void quantize_row_q4_0_ref(const float * GGML_RESTRICT x, block_q4_0 * GGML_REST
     for (int i = 0; i < nb; i++) {
         float amax = 0.0f; // absolute max
         float max  = 0.0f;
+        float min  = FLT_MAX;
+        double sum = 0.0;
+        double sum_sq = 0.0;
 
         for (int j = 0; j < qk; j++) {
             const float v = x[i*qk + j];
@@ -39,12 +111,28 @@ void quantize_row_q4_0_ref(const float * GGML_RESTRICT x, block_q4_0 * GGML_REST
                 amax = fabsf(v);
                 max  = v;
             }
+            if (v < min) min = v;
+            sum += v;
+            sum_sq += v * v;
         }
 
         const float d  = max / -8;
         const float id = d ? 1.0f/d : 0.0f;
 
         y[i].d = GGML_FP32_TO_FP16(d);
+        
+        // Print per-block statistics (each block = 32 elements)
+        if (q4_0_block_stats.enabled && q4_0_current_layer == 15) {
+            double mean = sum / qk;
+            double variance = (sum_sq / qk) - (mean * mean);
+            
+            // Print every N blocks to avoid too much output
+            if (q4_0_block_stats.block_count % q4_0_block_stats.print_interval == 0) {
+                fprintf(stderr, "[L%02d][Block %6ld] min=% .6f, max=% .6f, mean=% .6f, var=%.6f, scale=% .6f\n",
+                        q4_0_current_layer, q4_0_block_stats.block_count, min, max, mean, variance, d);
+            }
+            q4_0_block_stats.block_count++;
+        }
 
         for (int j = 0; j < qk/2; ++j) {
             const float x0 = x[i*qk + 0    + j]*id;
@@ -283,6 +371,57 @@ void dequantize_row_q4_1(const block_q4_1 * GGML_RESTRICT x, float * GGML_RESTRI
 
             y[i*qk + j + 0   ] = x0*d + m;
             y[i*qk + j + qk/2] = x1*d + m;
+        }
+    }
+} 
+
+// Per-channel Q4_0 quantization with pre-calibrated scales
+// x: input float array [n_embd, seq_len]
+// y: output pc_q4_0 array [n_embd], each with variable size
+// scales: pre-calibrated scales from scales_k.bin [n_embd]
+// n_embd: number of channels (embedding dimension)
+// seq_len: sequence length (must be even for 4-bit packing)
+void quantize_row_q4_0_pc_ref(const float * GGML_RESTRICT x, pc_q4_0 * GGML_RESTRICT y, const float * GGML_RESTRICT scales, int64_t n_embd, int64_t seq_len) {
+    assert(seq_len % 2 == 0); // Must be even for nibble packing
+
+    for (int64_t ch = 0; ch < n_embd; ch++) {
+        // Use pre-calibrated scale from scales_k.bin
+        const float d = scales[ch];
+        const float id = d ? 1.0f / d : 0.0f;
+
+        // Store scale
+        y[ch].d = GGML_FP32_TO_FP16(d);
+
+        // Quantize and pack values
+        uint8_t * qs = y[ch].qs;
+        for (int64_t s = 0; s < seq_len / 2; s++) {
+            const float v0 = x[ch * seq_len + s * 2 + 0] * id;
+            const float v1 = x[ch * seq_len + s * 2 + 1] * id;
+
+            const uint8_t vi0 = MIN(15, (int8_t)(v0 + 8.5f));
+            const uint8_t vi1 = MIN(15, (int8_t)(v1 + 8.5f));
+
+            qs[s] = vi0 | (vi1 << 4);
+        }
+    }
+}
+
+// Per-channel Q4_0 dequantization
+// x: input pc_q4_0 array [n_embd]
+// y: output float array [n_embd, seq_len]
+// n_embd: number of channels
+// seq_len: sequence length
+void dequantize_row_q4_0_pc(const pc_q4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t n_embd, int64_t seq_len) {
+    for (int64_t ch = 0; ch < n_embd; ch++) {
+        const float d = GGML_FP16_TO_FP32(x[ch].d);
+        const uint8_t * qs = x[ch].qs;
+
+        for (int64_t s = 0; s < seq_len / 2; s++) {
+            const int v0 = (qs[s] & 0x0F) - 8;
+            const int v1 = (qs[s] >> 4) - 8;
+
+            y[ch * seq_len + s * 2 + 0] = v0 * d;
+            y[ch * seq_len + s * 2 + 1] = v1 * d;
         }
     }
 }

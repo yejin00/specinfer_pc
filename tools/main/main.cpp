@@ -50,6 +50,13 @@ static void print_usage(int argc, char ** argv) {
     LOG("\n");
 }
 
+//예진추가
+extern "C" {
+    void ggml_quantize_q4_0_enable_scale_stats(bool enable);
+    void ggml_quantize_q4_0_print_scale_stats(void);
+    void ggml_quantize_q4_0_reset_scale_stats(void);
+}
+
 static bool file_exists(const std::string & path) {
     std::ifstream f(path.c_str());
     return f.good();
@@ -91,6 +98,12 @@ int main(int argc, char ** argv) {
     }
 
     common_init();
+
+    // 예진추가: Q4_0 블록 통계 켜기 (K가 q4_0일 때만)
+    if (params.cache_type_k == GGML_TYPE_Q4_0) {
+        ggml_quantize_q4_0_enable_scale_stats(true);
+        fprintf(stderr, "[INFO] Q4_0 KV cache quantization statistics enabled (llama-cli)\n");
+    }
 
     auto & sparams = params.sampling;
 
@@ -146,6 +159,12 @@ int main(int argc, char ** argv) {
         LOG_ERR("%s: error: unable to load model\n", __func__);
         return 1;
     }
+
+    // 예진추가: 모델 로딩 완료 후 통계 카운터 리셋 (이후부터는 KV cache만 카운트)
+    // 주석: L00 통계를 보려면 리셋을 비활성화
+    // if (params.cache_type_k == GGML_TYPE_Q4_0) {
+    //     ggml_quantize_q4_0_reset_scale_stats();
+    // }
 
     auto * mem = llama_get_memory(ctx);
 

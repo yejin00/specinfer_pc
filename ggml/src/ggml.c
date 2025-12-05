@@ -848,6 +848,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 0,
         .is_quantized             = false,
     },
+    [GGML_TYPE_Q4_0_PC] = {
+        .type_name                = "q4_0_pc",
+        .blck_size                = 2, // 2 elements packed into 1 byte (4-bit per element)
+        .type_size                = 1, // 1 byte for 2 elements
+        .is_quantized             = true,
+        .to_float                 = NULL, // Custom dequantization in ggml_compute_forward_dup_f32
+        .from_float_ref           = NULL, // Custom quantization in ggml_compute_forward_dup_f32
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
@@ -1151,7 +1159,39 @@ size_t ggml_nbytes(const struct ggml_tensor * tensor) {
 
     size_t nbytes;
     const size_t blck_size = ggml_blck_size(tensor->type);
-    if (blck_size == 1) {
+    
+    // Special handling for Q4_0_PC (per-channel quantization)
+    // Memory layout: [all scales][all data]
+    // Q4_0_PC: Per-channel quantization for KV cache
+    // Layout: [scales][data]
+    // Can be 2D [n_dims, n_tokens] or 3D+ [head_dim, n_heads, n_tokens, ...]
+    if (tensor->type == GGML_TYPE_Q4_0_PC) {
+        int64_t n_dims, n_tokens;
+        int batch_dims_start;
+        
+        // Check if 2D or 3D+
+        if (tensor->ne[2] == 1 && tensor->ne[3] == 1) {
+            // 2D: [n_dims, n_tokens]
+            n_dims = tensor->ne[0];
+            n_tokens = tensor->ne[1];
+            batch_dims_start = 2;
+        } else {
+            // 3D+: [head_dim, n_heads, n_tokens, ...]
+            n_dims = tensor->ne[0] * tensor->ne[1];
+            n_tokens = tensor->ne[2];
+            batch_dims_start = 3;
+        }
+        
+        const size_t scales_size = n_dims * sizeof(ggml_half);
+        const size_t data_size = n_dims * ((n_tokens + 1) / 2);
+        nbytes = scales_size + data_size;
+        
+        // Multiply by higher dimensions
+        for (int i = batch_dims_start; i < GGML_MAX_DIMS; ++i) {
+            nbytes *= tensor->ne[i];
+        }
+    }
+    else if (blck_size == 1) {
         nbytes = ggml_type_size(tensor->type);
         for (int i = 0; i < GGML_MAX_DIMS; ++i) {
             nbytes += (tensor->ne[i] - 1)*tensor->nb[i];
@@ -1180,8 +1220,16 @@ size_t ggml_type_size(enum ggml_type type) {
 }
 
 size_t ggml_row_size(enum ggml_type type, int64_t ne) {
-    assert(ne % ggml_blck_size(type) == 0);
-    return ggml_type_size(type)*ne/ggml_blck_size(type);
+    // Q4_0_PC: 4-bit per element, so ne elements = ne/2 bytes (data only, no scales)
+    if (type == GGML_TYPE_Q4_0_PC) {
+        return (ne + 1) / 2;  // Round up for odd ne
+    }
+    
+    size_t type_size = ggml_type_size(type);
+    int64_t blck_size = ggml_blck_size(type);
+    
+    assert(ne % blck_size == 0);
+    return type_size * ne / blck_size;
 }
 
 double ggml_type_sizef(enum ggml_type type) {
@@ -1627,10 +1675,39 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         result->ne[i] = ne[i];
     }
 
-    result->nb[0] = ggml_type_size(type);
-    result->nb[1] = result->nb[0]*(result->ne[0]/ggml_blck_size(type));
-    for (int i = 2; i < GGML_MAX_DIMS; i++) {
-        result->nb[i] = result->nb[i - 1]*result->ne[i - 1];
+    // Special stride calculation for Q4_0_PC (per-channel quantization)
+    if (type == GGML_TYPE_Q4_0_PC) {
+        // Q4_0_PC layout: [all_scales][all_data]
+        // Shape can be 2D [n_dims, n_tokens] or 3D+ [head_dim, n_heads, n_tokens, ...]
+        int64_t n_dims_total, n_tokens;
+        
+        if (result->ne[2] == 1 && result->ne[3] == 1) {
+            // 2D case: [n_dims, n_tokens]
+            n_dims_total = result->ne[0];
+            n_tokens = result->ne[1];
+            
+            result->nb[0] = 1;  // 4-bit per element (packed)
+            result->nb[1] = n_dims_total * sizeof(ggml_half) + (n_dims_total * n_tokens + 1) / 2;
+            result->nb[2] = result->nb[1] * result->ne[1];
+            result->nb[3] = result->nb[2] * result->ne[2];
+        } else {
+            // 3D+ case: [head_dim, n_heads, n_tokens, ...]
+            n_dims_total = result->ne[0] * result->ne[1];
+            n_tokens = result->ne[2];
+            
+            result->nb[0] = 1;  // 4-bit per element (packed)
+            result->nb[1] = result->ne[0] / 2;  // One head in data section (4-bit packed)
+            result->nb[2] = n_dims_total / 2;  // One token in data section (4-bit packed)
+            for (int i = 3; i < GGML_MAX_DIMS; i++) {
+                result->nb[i] = result->nb[i - 1] * result->ne[i - 1];
+            }
+        }
+    } else {
+        result->nb[0] = ggml_type_size(type);
+        result->nb[1] = result->nb[0]*(result->ne[0]/ggml_blck_size(type));
+        for (int i = 2; i < GGML_MAX_DIMS; i++) {
+            result->nb[i] = result->nb[i - 1]*result->ne[i - 1];
+        }
     }
 
     ctx->n_objects++;
@@ -3241,9 +3318,32 @@ struct ggml_tensor * ggml_view_3d(
 
     struct ggml_tensor * result = ggml_view_impl(ctx, a, 3, ne, offset);
 
-    result->nb[1] = nb1;
-    result->nb[2] = nb2;
-    result->nb[3] = result->nb[2]*ne2;
+    // Special handling for Q4_0_PC: use provided strides (don't override!)
+    if (result->type == GGML_TYPE_Q4_0_PC) {
+        // Q4_0_PC layout: [scales][data]
+        // Data is stored as data[dim][token] (per-channel layout)
+        // Use the strides provided by the caller (nb1, nb2)
+        
+        // static int view_count = 0;
+        // if (view_count < 5) {
+        //     fprintf(stderr, "ggml_view_3d Q4_0_PC #%d ne=[%ld,%ld,%ld]\n", view_count, ne0, ne1, ne2);
+        //     fflush(stderr);
+        // }
+        // view_count++;
+        
+        // Use provided strides for per-channel layout
+        result->nb[1] = nb1;
+        result->nb[2] = nb2;
+        // nb3: total size of [scales][data] for one batch
+        const int64_t n_dims_total = ne0 * ne1;
+        const size_t scales_size = n_dims_total * sizeof(ggml_fp16_t);
+        const size_t data_size = (n_dims_total * ne2 + 1) / 2;  // 4-bit packed
+        result->nb[3] = scales_size + data_size;
+    } else {
+        result->nb[1] = nb1;
+        result->nb[2] = nb2;
+        result->nb[3] = result->nb[2]*ne2;
+    }
 
     return result;
 }

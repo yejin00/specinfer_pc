@@ -58,6 +58,8 @@ set(GGML_OPENCL_KERNELS
     argsort
     clamp
     cpy
+    cpy_q4_0
+    quantize_pc
     cvt
     diag_mask_inf
     div

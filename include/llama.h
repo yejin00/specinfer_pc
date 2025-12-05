@@ -358,6 +358,7 @@ extern "C" {
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
+        const char * type_k_scales_path; // path to per-channel scales file for Q4_0_PC (e.g., scales_k.bin)
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

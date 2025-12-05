@@ -13,6 +13,11 @@
 #include <cmath>
 #include <cstring>
 
+// for Q4_0 stats layer tagging
+extern "C" {
+    void ggml_quantize_q4_0_set_current_layer(int il);
+}
+
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -1107,6 +1112,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
              float     kq_scale) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
+    // Handle Q4_0_PC KV cache - must dequantize BEFORE permute
+    if (k->type == GGML_TYPE_Q4_0_PC) {
+        ggml_tensor * k_f32 = ggml_new_tensor(ctx0, GGML_TYPE_F32, GGML_MAX_DIMS, k->ne);
+        ggml_format_name(k_f32, "%s (f32)", k->name);
+        k = ggml_cpy(ctx0, k, k_f32);
+    }
+
     q = ggml_permute(ctx0, q, 0, 2, 1, 3);
     k = ggml_permute(ctx0, k, 0, 2, 1, 3);
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
@@ -1126,7 +1138,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
 
         // this can happen when KV cache is not used (e.g. an embedding model with non-causal attn)
-        if (k->type == GGML_TYPE_F32) {
+        // also handle Q4_0_PC quantized KV cache
+        if (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_Q4_0_PC) {
             k = ggml_cast(ctx0, k, GGML_TYPE_F16);
         }
 
@@ -1157,6 +1170,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*n_head, n_tokens);
     } else {
+        // Q4_0_PC is already dequantized before permute
+        
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
 
         // note: this op tends to require high floating point range
@@ -1312,6 +1327,10 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // store to KV cache
     {
+        // HACK: Mark k_cur and v_cur as outputs to force computation before cpy
+        ggml_set_output(k_cur);
+        ggml_set_output(v_cur);
+
         ggml_build_forward_expand(gf, kv_state->cpy_k(ctx0, k_cur, il));
         ggml_build_forward_expand(gf, kv_state->cpy_v(ctx0, v_cur, il));
     }
@@ -1366,6 +1385,11 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // store to KV cache
     {
+        // HACK: Mark k_cur and v_cur as outputs to force computation before cpy
+        // This is a workaround for GGML scheduler not respecting dependencies for Q4_0_PC
+        ggml_set_output(k_cur);
+        ggml_set_output(v_cur);
+
         ggml_build_forward_expand(gf, kv_state->cpy_k(ctx0, k_cur, il));
         ggml_build_forward_expand(gf, kv_state->cpy_v(ctx0, v_cur, il));
     }
@@ -1471,6 +1495,10 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // store to KV cache
     {
+        // HACK: Mark k_cur and v_cur as outputs to force computation before cpy
+        ggml_set_output(k_cur);
+        ggml_set_output(v_cur);
+        
         ggml_build_forward_expand(gf, kv_state->cpy_k(ctx0, k_cur, il));
         ggml_build_forward_expand(gf, kv_state->cpy_v(ctx0, v_cur, il));
     }
