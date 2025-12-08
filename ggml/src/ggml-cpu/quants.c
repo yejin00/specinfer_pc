@@ -1155,3 +1155,19 @@ void quantize_row_iq4_xs(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, 
     assert(k % QK_K == 0);
     quantize_iq4_xs(x, y, 1, k, NULL);
 }
+
+// ===================================== Q4_0_PC =====================================
+
+// Q4_0_PC x Q8_0 Dot Product Kernel
+// This kernel handles the dot product between:
+// - vx: Q4_0_PC quantized Key Cache (Planar layout: [scales][data])
+// - vy: Q8_0 quantized Query Vector (Block layout)
+void ggml_vec_dot_q4_0_pc_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    // TODO: Implement the kernel
+    // Need to handle:
+    // 1. Retrieving scales from the separate scale buffer in vx
+    // 2. Computing correct strides for planar Q4_0_PC data
+    // 3. Dot product with Q8_0 block data in vy
+    
+    *s = 0.0f; // Placeholder
+}

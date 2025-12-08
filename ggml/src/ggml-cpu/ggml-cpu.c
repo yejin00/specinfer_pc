@@ -195,6 +195,11 @@ typedef pthread_t ggml_thread_t;
 #include <TargetConditionals.h>
 #endif
 
+
+//예진추가
+void ggml_vec_dot_q4_0_pc_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+
+
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F32] = {
         .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_f32,
@@ -370,7 +375,7 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     },
     [GGML_TYPE_Q4_0_PC] = {
         .from_float               = NULL,  // Custom quantization in ops.cpp
-        .vec_dot                  = ggml_vec_dot_q4_0_q8_0, 
+        .vec_dot                  = ggml_vec_dot_q4_0_pc_q8_0,
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
