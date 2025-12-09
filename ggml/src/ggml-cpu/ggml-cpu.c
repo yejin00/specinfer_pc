@@ -15,6 +15,15 @@
 #include "ops.h"
 #include "ggml.h"
 
+// Q4_0_PC Global Definitions
+float ** g_q4_0_pc_scales = NULL;
+int      g_q4_0_pc_cur_layer = 0;
+int      g_q4_0_pc_loaded = 0;
+
+void ggml_q4_0_pc_set_layer(int layer) {
+    g_q4_0_pc_cur_layer = layer;
+}
+
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
 #elif !defined(__FreeBSD__) && !defined(__NetBSD__) && !defined(__OpenBSD__)
@@ -1284,6 +1293,32 @@ static void ggml_compute_forward_mul_mat(
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
+    // [Q4_0_PC] Set current layer for dot product kernel
+    // 레이어번호 
+    if (src0->type == GGML_TYPE_Q4_0_PC) {
+        int layer_idx = -1;
+        // Expected formats: "q4_0_pc_op_L%d" or "cache_k_l%d"
+        const char * p = strstr(src0->name, "_L"); // Try _L first
+        if (!p) p = strstr(src0->name, "_l");      // Try _l next
+        
+        if (p) {
+            layer_idx = atoi(p + 2);
+        }
+
+        if (layer_idx >= 0) {
+            ggml_q4_0_pc_set_layer(layer_idx);
+        }
+    }
+
+
+    // if (src0->name[0] != '\0' && strstr(src0->name, "cache")) {
+    //     printf("[DEBUG-KV] mul_mat: Name=%s, Type=%s x %s, Shape=[%ld, %ld]\n",
+    //         src0->name,
+    //         ggml_type_name(src0->type),
+    //         ggml_type_name(src1->type),
+    //         src0->ne[0], src0->ne[1]);
+    // }
+
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int ith = params->ith;
@@ -1340,6 +1375,7 @@ UseGgmlGemm1:;
 #endif
 
     if (src1->type != vec_dot_type) {
+        
         char * wdata = params->wdata;
 
         const size_t nbw0 = ggml_type_size(vec_dot_type);
@@ -1349,6 +1385,11 @@ UseGgmlGemm1:;
 
         assert(params->wsize >= ne13*nbw3);
         GGML_ASSERT(src1->type == GGML_TYPE_F32);
+
+        // if (strstr(src0->name, "cache")) {
+        // printf("[DEBUG-KV] Converting Query(src1) %s -> %s for MatMul\n", 
+        //        ggml_type_name(src1->type), ggml_type_name(vec_dot_type));
+        // }
 
     #if 0
         for (int64_t i13 = 0; i13 < ne13; ++i13) {

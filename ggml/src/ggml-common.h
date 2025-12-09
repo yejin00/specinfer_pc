@@ -172,11 +172,11 @@ typedef struct {
 static_assert(sizeof(block_q4_0) == sizeof(ggml_half) + QK4_0 / 2, "wrong q4_0 block size/padding");
 
 // Per-channel Q4_0 for KV cache
+#define QK4_0 32
 typedef struct {
-    ggml_half d;           // scale for this channel
-    uint8_t qs[1];         // nibbles / quants (actual size = seq_len/2, variable length array)
-} pc_q4_0;
-// Note: sizeof(pc_q4_0) is just the base size, actual size depends on seq_len
+    uint8_t qs[QK4_0 / 2]; // (scale is offline)
+} block_q4_0_pc;
+static_assert(sizeof(block_q4_0_pc) == QK4_0 / 2, "wrong q4_0_pc block size/padding");
 
 #define QK4_1 32
 typedef struct {
@@ -427,7 +427,19 @@ static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_
 #endif // GGML_COMMON_DECL
 #endif // GGML_COMMON_DECL
 
-////////////////////////////////////////////////////////////////////////////////
+// Q4_0_PC scale 전역변수로 설정 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+extern float ** g_q4_0_pc_scales;     
+extern int      g_q4_0_pc_cur_layer; 
+extern int      g_q4_0_pc_loaded;    
+void ggml_q4_0_pc_set_layer(int layer);
+
+#ifdef __cplusplus
+}
+#endif
 
 #ifndef GGML_COMMON_IMPL
 

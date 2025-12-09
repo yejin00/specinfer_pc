@@ -108,6 +108,7 @@ void quantize_row_q8_K_generic(const float * GGML_RESTRICT x, void * GGML_RESTRI
 //===================================== Dot products =================================
 
 void ggml_vec_dot_q4_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    
     const int qk = QK8_0;
     const int nb = n / qk;
 
@@ -1158,16 +1159,56 @@ void quantize_row_iq4_xs(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, 
 
 // ===================================== Q4_0_PC =====================================
 
-// Q4_0_PC x Q8_0 Dot Product Kernel
-// This kernel handles the dot product between:
-// - vx: Q4_0_PC quantized Key Cache (Planar layout: [scales][data])
-// - vy: Q8_0 quantized Query Vector (Block layout)
 void ggml_vec_dot_q4_0_pc_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
-    // TODO: Implement the kernel
-    // Need to handle:
-    // 1. Retrieving scales from the separate scale buffer in vx
-    // 2. Computing correct strides for planar Q4_0_PC data
-    // 3. Dot product with Q8_0 block data in vy
+    const block_q4_0_pc * restrict x = (const block_q4_0_pc *)vx;
+    const block_q8_0    * restrict y = (const block_q8_0    *)vy;
     
-    *s = 0.0f; // Placeholder
+    // Safety check for global scales
+    if (!g_q4_0_pc_scales || g_q4_0_pc_cur_layer < 0) {
+        *s = 0.0f;
+        return;
+    }
+    const float * restrict scales = g_q4_0_pc_scales[g_q4_0_pc_cur_layer];
+    if (!scales) {
+        *s = 0.0f;
+        return;
+    }
+
+    const int nb = n / 32;
+    float sumf = 0.0f;
+
+    // Process blocks
+    for (int i = 0; i < nb; i++) {
+        const float d_y = GGML_FP16_TO_FP32(y[i].d);
+
+        for (int j = 0; j < 16; ++j) {
+            // Unpack Q4_0_PC nibbles (same layout as standard Q4_0)
+            // qs[j] contains elements j and j+16
+            uint8_t v = x[i].qs[j];
+            int8_t v0 = (int8_t)(v & 0x0F) - 8;
+            int8_t v1 = (int8_t)(v >> 4) - 8;
+            
+            // Corresponding global dimension indices
+            // Block i starts at i*32. 
+            // Element 0 is at i*32 + j
+            // Element 1 is at i*32 + j + 16
+            int dim0 = i * 32 + j;
+            int dim1 = i * 32 + j + 16;
+
+            // Retrieve Q8_0 values
+            int8_t y0 = y[i].qs[j];
+            int8_t y1 = y[i].qs[j + 16];
+            
+            // Retrieve per-channel scales
+            float s0 = scales[dim0];
+            float s1 = scales[dim1];
+
+            // Accumulate: (q_key * scale_key) * (q_query * scale_query)
+            // = q_key * q_query * scale_key * scale_query
+            sumf += (v0 * y0) * s0 * d_y;
+            sumf += (v1 * y1) * s1 * d_y;
+        }
+    }
+    
+    *s = sumf;
 }

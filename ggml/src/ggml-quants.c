@@ -377,54 +377,10 @@ void dequantize_row_q4_1(const block_q4_1 * GGML_RESTRICT x, float * GGML_RESTRI
 
 // Per-channel Q4_0 quantization with pre-calibrated scales
 // x: input float array [n_embd, seq_len]
-// y: output pc_q4_0 array [n_embd], each with variable size
+// y: output block_q4_0_pc array [n_embd], each with variable size
 // scales: pre-calibrated scales from scales_k.bin [n_embd]
 // n_embd: number of channels (embedding dimension)
 // seq_len: sequence length (must be even for 4-bit packing)
-void quantize_row_q4_0_pc_ref(const float * GGML_RESTRICT x, pc_q4_0 * GGML_RESTRICT y, const float * GGML_RESTRICT scales, int64_t n_embd, int64_t seq_len) {
-    assert(seq_len % 2 == 0); // Must be even for nibble packing
-
-    for (int64_t ch = 0; ch < n_embd; ch++) {
-        // Use pre-calibrated scale from scales_k.bin
-        const float d = scales[ch];
-        const float id = d ? 1.0f / d : 0.0f;
-
-        // Store scale
-        y[ch].d = GGML_FP32_TO_FP16(d);
-
-        // Quantize and pack values
-        uint8_t * qs = y[ch].qs;
-        for (int64_t s = 0; s < seq_len / 2; s++) {
-            const float v0 = x[ch * seq_len + s * 2 + 0] * id;
-            const float v1 = x[ch * seq_len + s * 2 + 1] * id;
-
-            const uint8_t vi0 = MIN(15, (int8_t)(v0 + 8.5f));
-            const uint8_t vi1 = MIN(15, (int8_t)(v1 + 8.5f));
-
-            qs[s] = vi0 | (vi1 << 4);
-        }
-    }
-}
-
-// Per-channel Q4_0 dequantization
-// x: input pc_q4_0 array [n_embd]
-// y: output float array [n_embd, seq_len]
-// n_embd: number of channels
-// seq_len: sequence length
-void dequantize_row_q4_0_pc(const pc_q4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t n_embd, int64_t seq_len) {
-    for (int64_t ch = 0; ch < n_embd; ch++) {
-        const float d = GGML_FP16_TO_FP32(x[ch].d);
-        const uint8_t * qs = x[ch].qs;
-
-        for (int64_t s = 0; s < seq_len / 2; s++) {
-            const int v0 = (qs[s] & 0x0F) - 8;
-            const int v1 = (qs[s] >> 4) - 8;
-
-            y[ch * seq_len + s * 2 + 0] = v0 * d;
-            y[ch * seq_len + s * 2 + 1] = v1 * d;
-        }
-    }
-}
 
 void dequantize_row_q5_0(const block_q5_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK5_0;

@@ -5,24 +5,47 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#define GGML_COMMON_DECL_CPP
+#include "../ggml/src/ggml-common.h"
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <vector>
 
 extern "C" void ggml_quantize_q4_0_set_head_cur(uint32_t head_cur);
-extern "C" void quantize_q4_0_pc_immediate(
-    const float * src_data,      // k_cur->data
-    char * base_tensor_data,     // k->data
-    int64_t n_dims,              // n_embd_k_gqa(il)
-    int64_t n_tokens,            // n_tokens
-    uint32_t head_cur,           // head_cur
-    int layer_idx,               // il
-    size_t kv_size,              // k->ne[1]
-    const char * scales_path     // "scales_k.bin"
-);
+
+static void load_global_pc_scales(const char * path, int max_layers, int n_dims) {
+    if (g_q4_0_pc_loaded) return;
+
+    FILE * fp = fopen(path, "rb");
+    if (!fp) {
+        fprintf(stderr, "[Q4_0_PC] Error: failed to open scales file '%s'\n", path);
+        return;
+    }
+
+    g_q4_0_pc_scales = (float **)malloc(max_layers * sizeof(float *));
+    
+    std::vector<float> temp_scales(n_dims);
+
+    for (int il = 0; il < max_layers; ++il) {
+        if (fread(temp_scales.data(), sizeof(float), n_dims, fp) != (size_t)n_dims) {
+            g_q4_0_pc_scales[il] = NULL;
+            break;
+        }
+        // Allocate memory for this layer's scales
+        g_q4_0_pc_scales[il] = (float *)malloc(n_dims * sizeof(float));
+        memcpy(g_q4_0_pc_scales[il], temp_scales.data(), n_dims * sizeof(float));
+    }
+
+    fclose(fp);
+    g_q4_0_pc_loaded = 1;
+    // fprintf(stderr, "[Q4_0_PC] Loaded global scales for %d layers (dim=%d) from %s\n", max_layers, n_dims, path);
+}
 
 struct Q4_0_PC_Params {
     int64_t n_dims;
@@ -31,15 +54,95 @@ struct Q4_0_PC_Params {
     int layer_idx;
     size_t kv_size;
     char * k_data;
+    const char * scales_path;
 };
 
+// Custom Op: Quantize F32 -> Q4_0_PC (using global shared scales)
 extern "C" void custom_q4_0_pc_op(
     struct ggml_tensor * dst,
     const struct ggml_tensor * src,
     int ith,
     int nth,
     void * userdata
-);
+) {
+    Q4_0_PC_Params * params = (Q4_0_PC_Params *)userdata;
+    
+    if (!g_q4_0_pc_loaded && params->scales_path) {
+        load_global_pc_scales(params->scales_path, 128, params->n_dims);
+    }
+    if (!g_q4_0_pc_scales || params->layer_idx < 0) return;
+    if (params->layer_idx >= 128) return;
+
+    const float * scales = g_q4_0_pc_scales[params->layer_idx];
+    if (!scales) return;
+
+    const float * src_data = (const float *)src->data;
+    
+    int64_t n_dims = params->n_dims; 
+    int64_t n_tokens = params->n_tokens;
+    
+    int64_t t_start = (n_tokens * ith) / nth;
+    int64_t t_end   = (n_tokens * (ith + 1)) / nth;
+
+    const int block_size = 32;
+    int64_t n_blocks_per_token = n_dims / block_size;
+
+    for (int64_t t = t_start; t < t_end; ++t) {
+        const float * src_ptr = src_data + t * n_dims;
+
+        int64_t token_idx = params->head_cur + t;
+
+        // [Verification Log] - Print first few dims of Layer 0, first token of the batch
+        // if (params->layer_idx == 0 && t == 0) {
+        //     printf("\n[DEBUG-Q4_0_PC] Quantization Verify (Layer 0, Token %ld):\n", token_idx);
+        //     for (int d = 0; d < 10; d++) { // Check first 10 dims
+        //         float val = src_ptr[d];
+        //         float scale = scales[d];
+        //         float inv = (scale != 0.0f) ? (1.0f / scale) : 0.0f;
+        //         int8_t q = (int8_t)roundf(val * inv);
+        //         q = std::max((int8_t)-8, std::min((int8_t)7, q));
+        //         printf("  Dim %d: Val=%.6f, Scale=%.6f, Q=%d\n", d, val, scale, q);
+        //     }
+        //     // Check a later dim (e.g. 128) to confirm scale changes
+        //     if (n_dims > 128) {
+        //         int d = 128;
+        //         printf("  Dim %d: Val=%.6f, Scale=%.6f\n", d, src_ptr[d], scales[d]);
+        //     }
+        //     printf("---------------------------------------------------\n");
+        // }
+
+        
+        char * dst_row_ptr = params->k_data + token_idx * n_blocks_per_token * sizeof(block_q4_0_pc);
+        block_q4_0_pc * dst_blocks = (block_q4_0_pc *)dst_row_ptr;
+
+        const int nb = n_blocks_per_token;
+        const int qk = block_size;
+
+        for (int i = 0; i < nb; i++) {
+            for (int j = 0; j < qk/2; ++j) {
+                const int idx0 = i*qk + 0    + j;
+                const int idx1 = i*qk + qk/2 + j;
+
+                const float s0 = scales[idx0];
+                const float s1 = scales[idx1];
+
+                const float id0 = s0 ? (1.0f / s0) : 0.0f;
+                const float id1 = s1 ? (1.0f / s1) : 0.0f;
+
+                const float x0 = src_ptr[idx0] * id0;
+                const float x1 = src_ptr[idx1] * id1;
+
+                const uint8_t xi0 = std::min(15, std::max(0, (int)(x0 + 8.5f)));
+                const uint8_t xi1 = std::min(15, std::max(0, (int)(x1 + 8.5f)));
+
+                dst_blocks[i].qs[j]  = xi0;
+                dst_blocks[i].qs[j] |= xi1 << 4;
+            }
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
 
 //
 // llama_kv_cache_unified
@@ -751,45 +854,6 @@ ggml_tensor * llama_kv_cache_unified::get_k(ggml_context * ctx, int32_t il, uint
 
     auto * k = layers[ikv].k;
 
-    // Special handling for Q4_0_PC with [scales][data] layout
-    if (k->type == GGML_TYPE_Q4_0_PC) {
-        // Memory layout: [all scales][all data]
-        // Data layout: data[dim][token] where dim = head * head_dim + dim_in_head
-        // 
-        // Per-channel quantization stores:
-        //   - All tokens for dim 0
-        //   - All tokens for dim 1
-        //   - ...
-        //   - All tokens for dim 4095
-        //
-        // To access [head_dim, n_heads, n_tokens], we need:
-        //   data[head * head_dim + dim_in_head][token]
-        
-        const size_t n_embd = hparams.n_embd_k_gqa(il);  // 4096
-        const size_t head_dim = hparams.n_embd_head_k;    // 128
-        const size_t n_heads = hparams.n_head_kv(il);     // 32
-        const size_t kv_size = k->ne[1];                  // max tokens (e.g., 4096)
-        
-        // Offset: skip scales section to start at data
-        const size_t scales_offset = n_embd * sizeof(ggml_fp16_t);  // 8192 bytes
-        
-        // Strides within the data section (4-bit packed)
-        // Per-channel layout: data[dim][token]
-        // nb0 = 1 (nibble, set by ggml_view_3d)
-        // nb1 = kv_size / 2 (to go to next dim within same head, skip all tokens)
-        // nb2 = head_dim * kv_size / 2 (to go to next head, skip head_dim * kv_size)
-        const size_t nb1 = kv_size / 2;           // stride between dims (all tokens)
-        const size_t nb2 = head_dim * kv_size / 2; // stride between heads
-        
-        return ggml_view_3d(ctx, k,
-                head_dim,           // ne0: 128
-                n_heads,            // ne1: 32
-                n_kv,               // ne2: n_kv tokens
-                nb1,                // nb1: stride to next dim (skip all tokens)
-                nb2,                // nb2: stride to next head
-                scales_offset);     // offset: skip scales
-    }
-    
     return ggml_view_3d(ctx, k,
             hparams.n_embd_head_k, hparams.n_head_kv(il), n_kv,
             ggml_row_size(k->type, hparams.n_embd_head_k),
@@ -843,8 +907,10 @@ ggml_tensor * llama_kv_cache_unified::cpy_k(ggml_context * ctx, ggml_tensor * k_
             (int64_t)n_tokens,
             head_cur,
             il,
-            k->ne[1],
-            (char *)k->data
+            (size_t)k->ne[1],
+            (char *)k->data,
+            //일단 하드코딩으로 이름 지정해서 넣어주는걸로함 --> 추후 수정 
+            "scales_k.bin"
         };
 
         ggml_tensor * dummy = ggml_map_custom1(ctx, k_cur, custom_q4_0_pc_op, 1, params);
