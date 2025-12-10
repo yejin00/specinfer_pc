@@ -57,6 +57,7 @@ struct Q4_0_PC_Params {
     const char * scales_path;
 };
 
+//thread 다 쓰는지 map custom에서 
 // Custom Op: Quantize F32 -> Q4_0_PC (using global shared scales)
 extern "C" void custom_q4_0_pc_op(
     struct ggml_tensor * dst,

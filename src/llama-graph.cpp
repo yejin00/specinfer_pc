@@ -1113,11 +1113,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // Handle Q4_0_PC KV cache - must dequantize BEFORE permute
-    if (k->type == GGML_TYPE_Q4_0_PC) {
-        ggml_tensor * k_f32 = ggml_new_tensor(ctx0, GGML_TYPE_F32, GGML_MAX_DIMS, k->ne);
-        ggml_format_name(k_f32, "%s (f32)", k->name);
-        k = ggml_cpy(ctx0, k, k_f32);
-    }
+    // if (k->type == GGML_TYPE_Q4_0_PC) {
+    //     ggml_tensor * k_f32 = ggml_new_tensor(ctx0, GGML_TYPE_F32, GGML_MAX_DIMS, k->ne);
+    //     ggml_format_name(k_f32, "%s (f32)", k->name);
+    //     k = ggml_cpy(ctx0, k, k_f32);
+    // }
 
     q = ggml_permute(ctx0, q, 0, 2, 1, 3);
     k = ggml_permute(ctx0, k, 0, 2, 1, 3);

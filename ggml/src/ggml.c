@@ -850,8 +850,8 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
     },
     [GGML_TYPE_Q4_0_PC] = {
         .type_name                = "q4_0_pc",
-        .blck_size                = 2, // 2 elements packed into 1 byte (4-bit per element)
-        .type_size                = 1, // 1 byte for 2 elements
+        .blck_size                = 32, // 2 elements packed into 1 byte (4-bit per element)
+        .type_size                = sizeof(block_q4_0_pc), // 1 byte for 2 elements
         .is_quantized             = true,
         .to_float                 = NULL, // Custom dequantization in ggml_compute_forward_dup_f32
         .from_float_ref           = NULL, // Custom quantization in ggml_compute_forward_dup_f32
@@ -1160,38 +1160,8 @@ size_t ggml_nbytes(const struct ggml_tensor * tensor) {
     size_t nbytes;
     const size_t blck_size = ggml_blck_size(tensor->type);
     
-    // Special handling for Q4_0_PC (per-channel quantization)
-    // Memory layout: [all scales][all data]
-    // Q4_0_PC: Per-channel quantization for KV cache
-    // Layout: [scales][data]
-    // Can be 2D [n_dims, n_tokens] or 3D+ [head_dim, n_heads, n_tokens, ...]
-    if (tensor->type == GGML_TYPE_Q4_0_PC) {
-        int64_t n_dims, n_tokens;
-        int batch_dims_start;
-        
-        // Check if 2D or 3D+
-        if (tensor->ne[2] == 1 && tensor->ne[3] == 1) {
-            // 2D: [n_dims, n_tokens]
-            n_dims = tensor->ne[0];
-            n_tokens = tensor->ne[1];
-            batch_dims_start = 2;
-        } else {
-            // 3D+: [head_dim, n_heads, n_tokens, ...]
-            n_dims = tensor->ne[0] * tensor->ne[1];
-            n_tokens = tensor->ne[2];
-            batch_dims_start = 3;
-        }
-        
-        const size_t scales_size = n_dims * sizeof(ggml_half);
-        const size_t data_size = n_dims * ((n_tokens + 1) / 2);
-        nbytes = scales_size + data_size;
-        
-        // Multiply by higher dimensions
-        for (int i = batch_dims_start; i < GGML_MAX_DIMS; ++i) {
-            nbytes *= tensor->ne[i];
-        }
-    }
-    else if (blck_size == 1) {
+    
+    if (blck_size == 1) {
         nbytes = ggml_type_size(tensor->type);
         for (int i = 0; i < GGML_MAX_DIMS; ++i) {
             nbytes += (tensor->ne[i] - 1)*tensor->nb[i];
@@ -1220,11 +1190,7 @@ size_t ggml_type_size(enum ggml_type type) {
 }
 
 size_t ggml_row_size(enum ggml_type type, int64_t ne) {
-    // Q4_0_PC: 4-bit per element, so ne elements = ne/2 bytes (data only, no scales)
-    if (type == GGML_TYPE_Q4_0_PC) {
-        return (ne + 1) / 2;  // Round up for odd ne
-    }
-    
+
     size_t type_size = ggml_type_size(type);
     int64_t blck_size = ggml_blck_size(type);
     

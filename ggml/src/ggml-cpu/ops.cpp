@@ -1171,183 +1171,6 @@ static void ggml_compute_forward_dup_f32(
 }
 
 
-extern "C" void quantize_q4_0_pc_immediate(
-    const float * src_data,
-    char * base_tensor_data,
-    int64_t n_dims,
-    int64_t n_tokens,
-    uint32_t head_cur,
-    int layer_idx,
-    size_t kv_size,
-    const char * scales_path
-) {
-    // 1. Static cache for scales (layer_idx -> scales vector)
-    static std::vector<std::vector<ggml_half>> cached_scales_per_layer(128); // Max 128 layers
-    static std::vector<bool> is_layer_loaded(128, false);
-
-    if (layer_idx >= 128) {
-        fprintf(stderr, "Error: layer_idx %d exceeds max supported 128\n", layer_idx);
-        return;
-    }
-
-    // Load scales if not loaded
-    if (!is_layer_loaded[layer_idx]) {
-        FILE * fp = fopen(scales_path, "rb");
-        if (!fp) {
-            fprintf(stderr, "Error: failed to open scales file '%s'\n", scales_path);
-            return;
-        }
-
-        // Seek to layer position: layer_idx * n_dims * sizeof(float)
-        // Note: original file has float scales. We convert to half.
-        // Assuming file format: [layer0_scales(float)][layer1_scales(float)]...
-        // n_dims is typically 4096 or similar.
-        long offset = (long)layer_idx * n_dims * sizeof(float);
-        if (fseek(fp, offset, SEEK_SET) != 0) {
-            fprintf(stderr, "Error: seek failed for layer %d\n", layer_idx);
-            fclose(fp);
-            return;
-        }
-
-        std::vector<float> temp_scales(n_dims);
-        size_t read_count = fread(temp_scales.data(), sizeof(float), n_dims, fp);
-        if (read_count != (size_t)n_dims) {
-            fprintf(stderr, "Error: read failed for layer %d (read %zu, expected %ld)\n", 
-                    layer_idx, read_count, n_dims);
-            fclose(fp);
-            return;
-        }
-        fclose(fp);
-
-        cached_scales_per_layer[layer_idx].resize(n_dims);
-        for (int i = 0; i < n_dims; i++) {
-            cached_scales_per_layer[layer_idx][i] = GGML_FP32_TO_FP16(temp_scales[i]);
-        }
-        is_layer_loaded[layer_idx] = true;
-        
-        // fprintf(stderr, "quantize_q4_0_pc_immediate: Loaded scales for layer %d\n", layer_idx);
-    }
-
-    const std::vector<ggml_half>& scales = cached_scales_per_layer[layer_idx];
-        if (layer_idx == 0) {
-        static int deep_verify_count = 0;
-        if (deep_verify_count < 5) { // Prefill(0), Generation(1,2,3,4) 확인
-            int check_dim = 0; // 0번 차원 확인
-            int check_tok = 0; // 현재 배치의 0번 토큰 확인
-
-            float src_val = src_data[check_tok * n_dims + check_dim];
-            
-            // 2. 해당 차원의 Scale
-            float scale_val = GGML_FP16_TO_FP32(scales[check_dim]);
-            
-            // 3. 예상되는 Quantized 값
-            float inv_scale = (scale_val != 0.0f) ? (1.0f / scale_val) : 0.0f;
-            int8_t expected_q = (int8_t)roundf(src_val * inv_scale);
-            expected_q = std::max((int8_t)-8, std::min((int8_t)7, expected_q));
-            
-            fprintf(stderr, "\n[DEEP VERIFY] Layer 0, Token %d (Generation Step? %s)\n", 
-                deep_verify_count, (n_tokens == 1) ? "YES" : "NO (Prefill)");
-            fprintf(stderr, "  - Dim 0 Src Val : %.6f\n", src_val);
-            fprintf(stderr, "  - Dim 0 Scale   : %.6f\n", scale_val);
-            fprintf(stderr, "  - Scaled Val    : %.6f (Src / Scale)\n", src_val * inv_scale);
-            fprintf(stderr, "  - Expected Int4 : %d\n", expected_q);
-
-            uint8_t * dst_data_base = (uint8_t *)(base_tensor_data + n_dims * sizeof(ggml_half));
-            uint8_t * dim_base_ptr = dst_data_base + (check_dim * (kv_size / 2));
-            uint32_t cur_pos = head_cur + check_tok;
-            size_t byte_idx = cur_pos / 2;
-            bool high = (cur_pos % 2) != 0;
-            
-            fprintf(stderr, "  -> Will write to byte_idx: %zu, high_nibble: %s\n", byte_idx, high ? "TRUE" : "FALSE");
-            
-            deep_verify_count++;
-        }
-    }
-
-
-    ggml_half * dst_scales = (ggml_half *)base_tensor_data;
-    memcpy(dst_scales, scales.data(), n_dims * sizeof(ggml_half));
-
-
-    // 3. Quantize and write data
-    // Data offset: n_dims * sizeof(ggml_half)
-    uint8_t * dst_data_base = (uint8_t *)(base_tensor_data + n_dims * sizeof(ggml_half));
-
-    // Layout: [dim][token]
-    // We are writing 'n_tokens' for each dimension, starting at 'head_cur'.
-    // src_data is [n_tokens][n_dims] (contiguous F32)
-    
-    // Parallelize over dims
-    #pragma omp parallel for
-    for (int64_t dim = 0; dim < n_dims; dim++) {
-        float scale_val = GGML_FP16_TO_FP32(scales[dim]);
-        float inv_scale = (scale_val != 0.0f) ? (1.0f / scale_val) : 0.0f;
-
-        // Destination ptr for this dim
-        // Each dim has 'kv_size' tokens (4-bit packed -> kv_size/2 bytes)
-        // We want to write at offset: head_cur
-        // byte_offset = head_cur / 2
-        // is_high_nibble = head_cur % 2
-        
-        uint8_t * dim_base_ptr = dst_data_base + (dim * (kv_size / 2));
-
-        for (int64_t tok = 0; tok < n_tokens; tok++) {
-            // Source value
-            float val = src_data[tok * n_dims + dim]; // src is [token][dim]
-            
-            // Quantize
-            int8_t q = (int8_t)roundf(val * inv_scale);
-            q = std::max((int8_t)-8, std::min((int8_t)7, q));
-            uint8_t qu = (q + 8) & 0x0F;
-
-            // Target position
-            uint32_t cur_pos = head_cur + tok;
-            if (cur_pos >= kv_size) continue; // Boundary check
-
-            size_t byte_idx = cur_pos / 2;
-            bool high = (cur_pos % 2) != 0;
-
-            if (!high) {
-                // Low nibble: clear low 4 bits, set new
-                dim_base_ptr[byte_idx] = (dim_base_ptr[byte_idx] & 0xF0) | qu;
-            } else {
-                // High nibble: clear high 4 bits, set new
-                dim_base_ptr[byte_idx] = (dim_base_ptr[byte_idx] & 0x0F) | (qu << 4);
-            }
-        }
-    }    
-    
-    if (layer_idx == 0 && n_tokens == 1) { // Generation 1토큰일 때만 확인
-        static int mem_check_count = 0;
-        if (mem_check_count < 3) {
-            // 방금 쓴 값(0번 차원, 0번 토큰)을 메모리에서 다시 읽어봄
-            int check_dim = 0;
-            int check_tok = 0;
-            
-            uint8_t * dst_data_base = (uint8_t *)(base_tensor_data + n_dims * sizeof(ggml_half));
-            uint8_t * dim_base_ptr = dst_data_base + (check_dim * (kv_size / 2));
-            uint32_t cur_pos = head_cur + check_tok;
-            size_t byte_idx = cur_pos / 2;
-            bool high = (cur_pos % 2) != 0;
-            
-            uint8_t byte_val = dim_base_ptr[byte_idx];
-            int8_t stored_q = high ? (byte_val >> 4) : (byte_val & 0x0F);
-            if (stored_q >= 8) stored_q -= 16; // 4bit sign extension (0..15 -> -8..7)
-            // 주의: 위 sign extension은 2's complement가 아니라 offset binary라면 다름.
-            // (q + 8) & 0x0F -> 즉 0~15로 저장됨.
-            // 복원 로직: stored_val - 8
-            
-            int stored_int = (high ? (byte_val >> 4) : (byte_val & 0x0F));
-            int restored_q = stored_int - 8;
-            
-            fprintf(stderr, "  [MEM CHECK] Byte at %zu: 0x%02X -> Nibble: %d -> Restored q: %d\n", 
-                byte_idx, byte_val, stored_int, restored_q);
-            
-            mem_check_count++;
-        }
-    }
-}
-    
 
 struct Q4_0_PC_Params {
     int64_t n_dims;
@@ -1358,28 +1181,28 @@ struct Q4_0_PC_Params {
     char * k_data; 
 };
 
-extern "C" void custom_q4_0_pc_op(
-    struct ggml_tensor * dst,
-    const struct ggml_tensor * src,
-    int ith,
-    int nth,
-    void * userdata
-) {
-    if (ith != 0) return; // 멀티스레드 중복 실행 방지
+// extern "C" void custom_q4_0_pc_op(
+//     struct ggml_tensor * dst,
+//     const struct ggml_tensor * src,
+//     int ith,
+//     int nth,
+//     void * userdata
+// ) {
+//     if (ith != 0) return; // 멀티스레드 중복 실행 방지
 
-    Q4_0_PC_Params * params = (Q4_0_PC_Params *)userdata;
+//     Q4_0_PC_Params * params = (Q4_0_PC_Params *)userdata;
     
-    quantize_q4_0_pc_immediate(
-        (const float *)src->data,
-        params->k_data,
-        params->n_dims,
-        params->n_tokens,
-        params->head_cur,
-        params->layer_idx,
-        params->kv_size,
-        "scales_k.bin"
-    );
-}
+//     quantize_q4_0_pc_immediate(
+//         (const float *)src->data,
+//         params->k_data,
+//         params->n_dims,
+//         params->n_tokens,
+//         params->head_cur,
+//         params->layer_idx,
+//         params->kv_size,
+//         "scales_k.bin"
+//     );
+// }
 
 
 // A simplified version of ggml_compute_forward_dup that doesn't do float upcasting, and just plain old memcpy.

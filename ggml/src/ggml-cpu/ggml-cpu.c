@@ -17,11 +17,25 @@
 
 // Q4_0_PC Global Definitions
 float ** g_q4_0_pc_scales = NULL;
+void  * g_q4_0_pc_base_addrs[128] = {NULL}; // Base pointers for each layer
+size_t   g_q4_0_pc_row_sizes[128] = {0};    // Row size (bytes per token) for each layer
 int      g_q4_0_pc_cur_layer = 0;
 int      g_q4_0_pc_loaded = 0;
 
 void ggml_q4_0_pc_set_layer(int layer) {
     g_q4_0_pc_cur_layer = layer;
+}
+
+void ggml_q4_0_pc_set_base_addr(int layer, void * addr) {
+    if (layer >= 0 && layer < 128) {
+        g_q4_0_pc_base_addrs[layer] = addr;
+    }
+}
+
+void ggml_q4_0_pc_set_row_size(int layer, size_t size) {
+    if (layer >= 0 && layer < 128) {
+        g_q4_0_pc_row_sizes[layer] = size;
+    }
 }
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
@@ -1293,6 +1307,7 @@ static void ggml_compute_forward_mul_mat(
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
+
     // [Q4_0_PC] Set current layer for dot product kernel
     // 레이어번호 
     if (src0->type == GGML_TYPE_Q4_0_PC) {
@@ -1307,9 +1322,15 @@ static void ggml_compute_forward_mul_mat(
 
         if (layer_idx >= 0) {
             ggml_q4_0_pc_set_layer(layer_idx);
+            ggml_q4_0_pc_set_base_addr(layer_idx, src0->data);
+            ggml_q4_0_pc_set_row_size(layer_idx, src0->nb[1]);
+            
+            // [DEBUG] Check if mul_mat handles Q4_0_PC and correct layer
+            // printf("[DEBUG-MULMAT] Processing Q4_0_PC. Tensor: %s, Layer: %d\n", src0->name, layer_idx);
+        } else {
+             printf("[DEBUG-MULMAT] Q4_0_PC but NO LAYER FOUND in name: %s\n", src0->name);
         }
     }
-
 
     // if (src0->name[0] != '\0' && strstr(src0->name, "cache")) {
     //     printf("[DEBUG-KV] mul_mat: Name=%s, Type=%s x %s, Shape=[%ld, %ld]\n",
