@@ -4791,6 +4791,20 @@ struct llm_build_llama : public llm_graph_context {
                 Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
                 Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 
+                if (cparams.pre_rope)
+                {   
+                    const auto * kv_state = static_cast<const llama_kv_cache_unified_state *>(mstate);
+
+                    ggml_set_output(Kcur);
+                    ggml_set_output(Vcur);
+
+                    ggml_build_forward_expand(gf, kv_state->cpy_k(ctx0, Kcur, il));
+                    ggml_build_forward_expand(gf, kv_state->cpy_v(ctx0, Vcur, il));
+
+                    Kcur = kv_state->get_k(ctx0, il);
+                    Vcur = kv_state->get_v(ctx0, il);
+                }
+
                 Qcur = ggml_rope_ext(
                         ctx0, Qcur, inp_pos, rope_factors,
                         n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,

@@ -1487,6 +1487,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_FLASH_ATTN"));
     add_opt(common_arg(
+        {"-pre-rope", "--pre-rope"},
+        string_format("enable pre-rope KV cache Store (default: %s)", params.pre_rope ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.pre_rope = true;
+        }
+    ).set_env("LLAMA_ARG_PRE_ROPE"));
+    add_opt(common_arg(
         {"-p", "--prompt"}, "PROMPT",
         "prompt to start generation with; for system message, use -sys",
         [](common_params & params, const std::string & value) {

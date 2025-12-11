@@ -1323,25 +1323,27 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_build_forward_expand(gf, k_cur);
     ggml_build_forward_expand(gf, v_cur);
 
-    const auto * kv_state = static_cast<const llama_kv_cache_unified_state *>(mstate);
-
     // store to KV cache
+    if (!cparams.pre_rope)
     {
+         const auto * kv_state = static_cast<const llama_kv_cache_unified_state *>(mstate);
         // HACK: Mark k_cur and v_cur as outputs to force computation before cpy
         ggml_set_output(k_cur);
         ggml_set_output(v_cur);
 
         ggml_build_forward_expand(gf, kv_state->cpy_k(ctx0, k_cur, il));
         ggml_build_forward_expand(gf, kv_state->cpy_v(ctx0, v_cur, il));
+
+        k_cur = kv_state->get_k(ctx0, il);
+        v_cur = kv_state->get_v(ctx0, il);
     }
 
     const auto & kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = kv_state->get_k(ctx0, il);
-    ggml_tensor * v = kv_state->get_v(ctx0, il);
+    
 
-    ggml_tensor * cur = build_attn_mha(gf, q, k, v, kq_b, kq_mask, v_mla, kq_scale);
+    ggml_tensor * cur = build_attn_mha(gf, q, k_cur, v_cur, kq_b, kq_mask, v_mla, kq_scale);
     cb(cur, "kqv_out", il);
 
     if (wo) {
