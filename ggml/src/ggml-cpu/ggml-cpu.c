@@ -1307,7 +1307,6 @@ static void ggml_compute_forward_mul_mat(
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
-
     // [Q4_0_PC] Set current layer for dot product kernel
     // 레이어번호 
     if (src0->type == GGML_TYPE_Q4_0_PC) {

@@ -4746,8 +4746,13 @@ struct llm_build_llama : public llm_graph_context {
 
         // inp_pos - contains the positions
         ggml_tensor * inp_pos = build_inp_pos();
-
         auto * inp_attn = build_attn_inp_kv_unified();
+
+        const auto * kv_state = static_cast<const llama_kv_cache_unified_state *>(mstate);
+        ggml_tensor * inp_kv;
+        // ggml_tensor * inp_kv = build_inp_k_cache_pos();
+        // 현재 Key_cache에 해당하는 
+        
 
         const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
@@ -4793,8 +4798,7 @@ struct llm_build_llama : public llm_graph_context {
 
                 if (cparams.pre_rope)
                 {   
-                    const auto * kv_state = static_cast<const llama_kv_cache_unified_state *>(mstate);
-
+                    
                     ggml_set_output(Kcur);
                     ggml_set_output(Vcur);
 
@@ -4803,20 +4807,38 @@ struct llm_build_llama : public llm_graph_context {
 
                     Kcur = kv_state->get_k(ctx0, il);
                     Vcur = kv_state->get_v(ctx0, il);
-                }
 
-                Qcur = ggml_rope_ext(
+                    if (il==0)
+                        inp_kv = build_inp_k_cache_pos();
+                    
+                    Qcur = ggml_rope_ext(
                         ctx0, Qcur, inp_pos, rope_factors,
                         n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                         ext_factor, attn_factor, beta_fast, beta_slow
                         );
 
-                Kcur = ggml_rope_ext(
+                    Kcur = ggml_rope_ext(
+                        ctx0, Kcur, inp_kv, rope_factors,
+                        n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                        ext_factor, attn_factor, beta_fast, beta_slow
+                        );
+                }
+                else 
+                {
+                    Qcur = ggml_rope_ext(
+                        ctx0, Qcur, inp_pos, rope_factors,
+                        n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                        ext_factor, attn_factor, beta_fast, beta_slow
+                        );
+
+                    Kcur = ggml_rope_ext(
                         ctx0, Kcur, inp_pos, rope_factors,
                         n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                         ext_factor, attn_factor, beta_fast, beta_slow
                         );
 
+                }
+                
                 cb(Qcur, "Qcur", il);
                 cb(Kcur, "Kcur", il);
                 cb(Vcur, "Vcur", il);
@@ -14474,6 +14496,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
             return LLAMA_ROPE_TYPE_NORM;
 
         // the pairs of head values are offset by n_rot/2
+        // case LLM_ARCH_LLAMA:
         case LLM_ARCH_FALCON:
         case LLM_ARCH_GROK:
         case LLM_ARCH_DBRX:

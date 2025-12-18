@@ -93,6 +93,33 @@ public:
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
 };
 
+// key_cache를 pre-rope로 저장하는 경우에 현재 Position_id들을 저장하는 값
+class llm_graph_input_k_cache_pos : public llm_graph_input_i {
+public:
+    llm_graph_input_k_cache_pos(
+            const llama_hparams & hparams,
+            const llama_cparams & cparams,
+            const llama_kv_cache_unified_state * kv_state,
+            const int64_t & n_pos_per_embd) :
+        hparams(hparams),
+        cparams(cparams),
+        kv_state(kv_state),
+        n_pos_per_embd(n_pos_per_embd) {
+    }
+    ~llm_graph_input_k_cache_pos() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * pos = nullptr;
+
+    const llama_hparams & hparams;
+    const llama_cparams & cparams;
+
+    const llama_kv_cache_unified_state * kv_state;
+
+    const int64_t n_pos_per_embd = 1;
+};
+
 class llm_graph_input_pos : public llm_graph_input_i {
 public:
     llm_graph_input_pos(int64_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {}
@@ -328,6 +355,8 @@ public:
     const llama_memory_hybrid_state * mem_state;
 };
 
+
+
 //
 // llm_graph_result
 //
@@ -545,6 +574,7 @@ struct llm_graph_context {
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
     ggml_tensor * build_inp_embd_fc(ggml_tensor * embd, ggml_tensor * fc, ggml_tensor * fc_b) const;
     ggml_tensor * build_inp_pos() const;
+    ggml_tensor * build_inp_k_cache_pos()  const; // pre-rope로 Key 값들을 저장하는 경우 position 값들을 어떻게 저장하는지 확인
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
     ggml_tensor * build_inp_mean() const;

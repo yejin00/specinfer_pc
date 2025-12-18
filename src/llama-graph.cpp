@@ -21,7 +21,6 @@ extern "C" {
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
-
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
     }
 
@@ -53,6 +52,10 @@ void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
             ggml_backend_tensor_set(pos, ubatch->pos, 0, n_tokens*n_pos_per_embd*ggml_element_size(pos));
         }
     }
+}
+
+void llm_graph_input_k_cache_pos::set_input(const llama_ubatch * ubatch) {
+    kv_state -> set_input_k_cache_pos(pos,ubatch,n_pos_per_embd); 
 }
 
 void llm_graph_input_attn_temp::set_input(const llama_ubatch * ubatch) {
@@ -940,16 +943,29 @@ ggml_tensor * llm_graph_context::build_inp_embd_fc(ggml_tensor * embd, ggml_tens
 
 
 ggml_tensor * llm_graph_context::build_inp_pos() const {
-    auto inp = std::make_unique<llm_graph_input_pos>(n_pos_per_embd());
+    auto inp = std::make_unique<llm_graph_input_pos>(n_pos_per_embd()); // Step1: 1) n_pos_per_embd: 하나의 Embedding당 얼마나 많은 position data를 요구하는지 2) llm_graph_input_pos 값 할당: 
 
     auto & cur = inp->pos;
 
-    cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens*n_pos_per_embd());
-    ggml_set_input(cur);
+    cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens*n_pos_per_embd()); // Step2) llm_graph_input_pos의 Input 정보에 (n_tokens)*(n_pos_per_embd) 값 설정
+    ggml_set_input(cur); // Step3) ggml tensor의 Input tensor라는 FLAG 설정
+    res->add_input(std::move(inp)); // Step4) llm 값에 input을 여기 llm_graph_result라는 값에 할당한다
 
-    res->add_input(std::move(inp));
+    return cur; // Step5) 
+}
 
-    return cur;
+ggml_tensor * llm_graph_context::build_inp_k_cache_pos() const {
+    const auto * kv_state = static_cast<const llama_kv_cache_unified_state *>(mstate);
+
+    auto inp = std::make_unique<llm_graph_input_k_cache_pos>(hparams, cparams, kv_state, n_pos_per_embd()); // Step1: 1) n_pos_per_embd: 하나의 Embedding당 얼마나 많은 position data를 요구하는지 2) llm_graph_input_pos 값 할당: 
+    
+        auto & cur = inp->pos;
+        const auto n_kv = kv_state->get_n_kv();
+        cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_kv*n_pos_per_embd());
+        ggml_set_input(cur);
+        res->add_input(std::move(inp));
+
+    return cur; // Step5) 
 }
 
 ggml_tensor * llm_graph_context::build_inp_attn_scale() const {
@@ -1288,16 +1304,16 @@ ggml_tensor * llm_graph_context::build_attn(
 llm_graph_input_attn_kv_unified * llm_graph_context::build_attn_inp_kv_unified() const {
     const auto * kv_state = static_cast<const llama_kv_cache_unified_state *>(mstate);
 
-    auto inp = std::make_unique<llm_graph_input_attn_kv_unified>(hparams, cparams, kv_state);
+    auto inp = std::make_unique<llm_graph_input_attn_kv_unified>(hparams, cparams, kv_state); // Step1: llm_graph_input_attn_kv_unified 구조체 할당
 
     {
         GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE && "Use llama_kv_cache_unified_iswa for SWA");
 
-        const auto n_kv = kv_state->get_n_kv();
+        const auto n_kv = kv_state->get_n_kv(); // Step2: 현재 KV length의 개수 추출
 
-        inp->self_kq_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv, GGML_PAD(n_tokens, GGML_KQ_MASK_PAD));
+        inp->self_kq_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv, GGML_PAD(n_tokens, GGML_KQ_MASK_PAD)); // GGML_KQ_MASK_PAD: 64, 
         //cb(inp->self_kq_mask, "KQ_mask", -1);
-        ggml_set_input(inp->self_kq_mask);
+        ggml_set_input(inp->self_kq_mask); // Step4: Input 값으로 설정함 
 
         inp->self_kq_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->self_kq_mask, GGML_TYPE_F16) : inp->self_kq_mask;
     }

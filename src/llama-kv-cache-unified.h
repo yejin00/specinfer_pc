@@ -127,6 +127,7 @@ public:
     //
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_k_cache_pos (ggml_tensor *dst, const llama_ubatch * ubatch, const int64_t & n_pos_per_embd,const int32_t & n_kv) const;
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
@@ -266,6 +267,7 @@ public:
     void set_input_k_shift(ggml_tensor * dst) const;
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_k_cache_pos (ggml_tensor * dst, const llama_ubatch * ubatch, const int64_t &n_pos_per_embd) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
 private:

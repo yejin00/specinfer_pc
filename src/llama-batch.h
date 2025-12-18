@@ -19,8 +19,8 @@ struct llama_ubatch {
     llama_token  *  token;    // [n_tokens]
     float        *  embd;     // [n_embd, n_tokens]
     llama_pos    *  pos;      // [n_tokens]
-    int32_t      *  n_seq_id; // [n_seqs]
-    llama_seq_id ** seq_id;   // [n_seqs]
+    int32_t      *  n_seq_id; // [n_seqs] 하나의 Sequence가 몇 개의 ID를 가졌는가? => ex) Beam Search와 같은 경우 동일한 Input Prompt가 4개의 Sequence ID를 구현할 수 있음
+    llama_seq_id ** seq_id;   // [n_seqs] 그 ID들의 번호는 무엇인가?
     int8_t       *  output;   // [n_tokens]
 };
 

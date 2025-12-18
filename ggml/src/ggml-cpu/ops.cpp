@@ -5360,7 +5360,7 @@ static void ggml_rope_cache_init(
      float theta_base, float freq_scale, const float * freq_factors, float corr_dims[2], int64_t ne0, float ext_factor, float mscale,
      float * cache, float sin_sign, float theta_scale) {
     // ref: https://github.com/jquesnelle/yarn/blob/master/scaled_rope/LlamaYaRNScaledRotaryEmbedding.py
-    float theta = theta_base;
+    float theta = theta_base; // theta_base: position_id
     for (int64_t i0 = 0; i0 < ne0; i0 += 2) {
         const float ff = freq_factors ? freq_factors[i0/2] : 1.0f;
         rope_yarn(
@@ -5368,7 +5368,7 @@ static void ggml_rope_cache_init(
         );
         cache[i0 + 1] *= sin_sign;
 
-        theta *= theta_scale;
+        theta *= theta_scale; // 각 Pair의 index가 증가할 때 마다 (position_ids)* theta_scale(thetabase^(-2i/D))를 적용
     }
 }
 
@@ -5435,9 +5435,9 @@ static void ggml_compute_forward_rope_f32(
         ggml_tensor * dst,
         const bool forward) {
 
-    const ggml_tensor * src0 = dst->src[0];
-    const ggml_tensor * src1 = dst->src[1];
-    const ggml_tensor * src2 = dst->src[2];
+    const ggml_tensor * src0 = dst->src[0]; // (Q,K)cur: [head_dim,num_head,seq_len,batch]
+    const ggml_tensor * src1 = dst->src[1]; // position_ids: [(n_tokens or n_kv)*4]
+    const ggml_tensor * src2 = dst->src[2]; // rope_factors: (llama3 부터 적용됨)
     
     // Debug disabled: trace RoPE execution
     // if (params->ith == 0 && dst->name && strstr(dst->name, "Kcur") != NULL) {
@@ -5445,7 +5445,7 @@ static void ggml_compute_forward_rope_f32(
     //     fprintf(stderr, "RoPE start: dst->name='%s', src0->data[0]=%.4f, thread=%d/%d\n",
     //             dst->name, test_src[0], params->ith, params->nth);
     // }
-
+    // printf("src1->data: %p\n",src1->data);
     float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
     int sections[4];
 
@@ -5488,11 +5488,11 @@ static void ggml_compute_forward_rope_f32(
     // row index used to determine which thread to use
     int ir = 0;
 
-    const float theta_scale = powf(freq_base, -2.0f/n_dims);
+    const float theta_scale = powf(freq_base, -2.0f/n_dims); // 주파수 감쇠 비율
 
     float corr_dims[2];
-    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
-
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims); // Step1: ggml_rope_yarn_corr_dims: yarn을 적용하여 
+    // printf("n_ctx_orig: %d\n",n_ctx_orig);
     const bool is_neox = mode & GGML_ROPE_TYPE_NEOX;
     const bool is_mrope = mode & GGML_ROPE_TYPE_MROPE;  // ggml_rope_multi, multimodal rotary position embedding
     const bool is_vision = mode == GGML_ROPE_TYPE_VISION;
@@ -5525,6 +5525,7 @@ static void ggml_compute_forward_rope_f32(
             float * cache = (float *) params->wdata + (ne0 + CACHE_LINE_SIZE_F32)*ith;
             if (!is_mrope) {
                 const int64_t p = pos[i2];
+                // printf("Position pos[i2]: %d\n",p );
                 ggml_rope_cache_init(p, freq_scale, freq_factors, corr_dims, ne0, ext_factor, attn_factor, cache, sin_sign, theta_scale);
             }
             else {
@@ -5536,7 +5537,10 @@ static void ggml_compute_forward_rope_f32(
                     p_t, p_h, p_w, p_e, sections, is_vision,
                     freq_scale, freq_factors, corr_dims, ne0, ext_factor, attn_factor, cache, sin_sign, theta_scale);
             }
-
+            // if (is_neox)
+            // {
+            //     printf("Llama2 models implement neox type of Rotary Positional Embedding\n");
+            // }
             for (int64_t i1 = 0; i1 < ne1; i1++) { // attn-heads
                 if (ir++ < ir0) continue;
                 if (ir   > ir1) break;
@@ -5561,7 +5565,7 @@ static void ggml_compute_forward_rope_f32(
                     } else {
                         for (int64_t i0 = 0; i0 < n_dims; i0 += 2) {
                             const int64_t ic = i0/2;
-
+                            
                             const float cos_theta = cache[i0 + 0];
                             const float sin_theta = cache[i0 + 1];
 
@@ -5612,7 +5616,7 @@ static void ggml_compute_forward_rope_f32(
                     for (int64_t i0 = n_dims; i0 < ne0; i0 += 2) {
                         const float * const src = (float *)((char *) src0->data + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
                         float * dst_data  = (float *)((char *)  dst->data + i3*nb3  + i2*nb2  + i1*nb1  + i0*nb0);
-
+                
                         dst_data[0] = src[0];
                         dst_data[1] = src[1];
                     }

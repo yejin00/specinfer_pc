@@ -963,7 +963,7 @@ void llama_kv_cache_unified::set_input_kq_mask(ggml_tensor * dst, const llama_ub
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     float * data = (float *) dst->data;
 
-    const int64_t n_kv = dst->ne[0];
+    const int64_t n_kv = dst->ne[0]; // 현재 KV cache의 data의 개수들
 
     // Use only the previous KV cells of the correct sequence for each token of the ubatch.
     // It's assumed that if a token in the batch has multiple sequences, they are equivalent.
@@ -977,33 +977,33 @@ void llama_kv_cache_unified::set_input_kq_mask(ggml_tensor * dst, const llama_ub
     //      xxxxx-----
     //      xxxxx-----
     // To visualize the mask, see https://github.com/ggml-org/llama.cpp/pull/12615
-    for (uint32_t h = 0; h < 1; ++h) {
+    for (uint32_t h = 0; h < 1; ++h) { //
         for (uint32_t s = 0; s < n_seqs; ++s) {
-            const llama_seq_id seq_id = ubatch->seq_id[s][0];
+            const llama_seq_id seq_id = ubatch->seq_id[s][0]; // Step1: 해당 seqs의 Seq_id값 search
 
             for (uint32_t j = 0; j < n_seq_tokens; ++j) {
-                const uint32_t idx = s*n_seq_tokens + j;
+                const uint32_t idx = s*n_seq_tokens + j; // Step2: indexing (llama_ubatch 안에서 현재 Token 번호 indexing)
 
-                const llama_pos p1 = ubatch->pos[idx];
+                const llama_pos p1 = ubatch->pos[idx]; // Step3: 해당 Token의 Position 값
 
-                for (uint32_t i = 0; i < n_kv; ++i) {
+                for (uint32_t i = 0; i < n_kv; ++i) { // Step4: 현재 KV의 값들 할당
                     float f = 0.0f;
 
                     bool masked = false;
 
-                    if (cells.is_empty(i)) {
+                    if (cells.is_empty(i)) { // Step 5: i 번째 위치의 값이 비워져있는지 확인
                         masked = true;
                     } else {
-                        const llama_pos p0 = cells.pos_get(i);
+                        const llama_pos p0 = cells.pos_get(i); // Step 6: i 위치에 position 값 추출 
 
-                        // mask the token if not the same sequence
-                        masked = masked || (!cells.seq_has(i, seq_id));
+                        // mask the token if not the same sequence 
+                        masked = masked || (!cells.seq_has(i, seq_id)); // Step 7: i 번째 data가 Seq_id를 포함하는지 확인 masked = (False) || !(position 값 가지고 있어)
 
                         // mask future tokens
-                        masked = masked || (causal_attn && p0 > p1);
+                        masked = masked || (causal_attn && p0 > p1); // Step 8: i 번째 data의 position 값이 현재 Input token 보다 더 멀리 있는 지 확인
 
                         // apply SWA if any
-                        masked = masked || (is_masked_swa(p0, p1));
+                        masked = masked || (is_masked_swa(p0, p1)); // Step 9: Sliding Window 밖에 있는 지 확인 
 
                         if (!masked && hparams.use_alibi) {
                             f = -std::abs(p0 - p1);
@@ -1029,7 +1029,25 @@ void llama_kv_cache_unified::set_input_kq_mask(ggml_tensor * dst, const llama_ub
         }
     }
 }
+void llama_kv_cache_unified::set_input_k_cache_pos(ggml_tensor * dst, const llama_ubatch * ubatch, const int64_t &n_pos_per_embd,const int32_t & n_kv) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    llama_pos * data = (llama_pos *) dst->data;
+    llama_pos p0;
+    for (uint32_t i1=0; i1 < n_kv; ++i1)
+    {
+        if (cells.is_empty(i1))
+            p0=-1;
+        else {
+            p0=cells.pos_get(i1);
+        }
+        const int64_t idx = n_pos_per_embd*i1;
+        for (uint32_t i2 = 0 ; i2 < n_pos_per_embd; i2++)
+        {
+            data[idx+i2]=p0;
+        }
+    }
 
+}
 void llama_kv_cache_unified::set_input_k_shift(ggml_tensor * dst) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
@@ -2001,7 +2019,9 @@ void llama_kv_cache_unified_state::set_input_k_shift(ggml_tensor * dst) const {
 void llama_kv_cache_unified_state::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
 }
-
+void llama_kv_cache_unified_state::set_input_k_cache_pos(ggml_tensor * dst, const llama_ubatch * ubatch, const int64_t &n_pos_per_embd) const {
+    kv->set_input_k_cache_pos(dst,ubatch,n_pos_per_embd,n_kv);
+}
 void llama_kv_cache_unified_state::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_pos_bucket(dst, ubatch);
 }

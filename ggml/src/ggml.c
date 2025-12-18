@@ -3604,7 +3604,7 @@ static struct ggml_tensor * ggml_rope_impl(
     GGML_ASSERT(ggml_is_vector(b));
     GGML_ASSERT(b->type == GGML_TYPE_I32);
     GGML_ASSERT(a->ne[2] == b->ne[0]);
-
+    
     if (c) {
         GGML_ASSERT(c->type == GGML_TYPE_F32);
         GGML_ASSERT(c->ne[0] >= n_dims / 2);
@@ -3615,8 +3615,8 @@ static struct ggml_tensor * ggml_rope_impl(
     struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
 
     int32_t params[15] = { /*n_past*/ 0, n_dims, mode, /*n_ctx*/ 0, n_ctx_orig };
-    memcpy(params +  5, &freq_base,    sizeof(float));
-    memcpy(params +  6, &freq_scale,   sizeof(float));
+    memcpy(params +  5, &freq_base,    sizeof(float)); // freq_base: Frequency의 base가 되는 값 
+    memcpy(params +  6, &freq_scale,   sizeof(float)); // Freq_scale: frequency의 Scaling이 추가되는 값
     memcpy(params +  7, &ext_factor,   sizeof(float));
     memcpy(params +  8, &attn_factor,  sizeof(float));
     memcpy(params +  9, &beta_fast,    sizeof(float));
@@ -3718,7 +3718,7 @@ struct ggml_tensor * ggml_rope_ext(
     return ggml_rope_impl(
         ctx, a, b, c, n_dims, mode, n_ctx_orig, freq_base, freq_scale,
         ext_factor, attn_factor, beta_fast, beta_slow, false
-    );
+    ); 
 }
 
 struct ggml_tensor * ggml_rope_ext_inplace(
@@ -3789,6 +3789,7 @@ void ggml_rope_yarn_corr_dims(
     int n_dims, int n_ctx_orig, float freq_base, float beta_fast, float beta_slow, float dims[2]
 ) {
     // start and end correction dims
+
     float start = floorf(ggml_rope_yarn_corr_dim(n_dims, n_ctx_orig, beta_fast, freq_base));
     float end   =  ceilf(ggml_rope_yarn_corr_dim(n_dims, n_ctx_orig, beta_slow, freq_base));
     dims[0] = MAX(0, start);
