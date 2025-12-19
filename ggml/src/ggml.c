@@ -991,9 +991,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "CROSS_ENTROPY_LOSS",
     "CROSS_ENTROPY_LOSS_BACK",
     "OPT_STEP_ADAMW",
+    "HADAMARD_TRANSFORM", // For Hadamard Transform
 };
 
-static_assert(GGML_OP_COUNT == 82, "GGML_OP_COUNT != 82");
+static_assert(GGML_OP_COUNT == 83, "GGML_OP_COUNT != 83");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1086,9 +1087,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "cross_entropy_loss(x,y)",
     "cross_entropy_loss_back(x,y)",
     "adamw(x)",
+    "hadamard_transform(x)", // For hadamard Transform
 };
 
-static_assert(GGML_OP_COUNT == 82, "GGML_OP_COUNT != 82");
+static_assert(GGML_OP_COUNT == 83, "GGML_OP_COUNT != 82");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -2871,6 +2873,22 @@ struct ggml_tensor * ggml_out_prod(
     result->op     = GGML_OP_OUT_PROD;
     result->src[0] = a;
     result->src[1] = b;
+
+    return result;
+}
+
+// ggml_hadamard_transform
+struct ggml_tensor * ggml_hadamard_transform(
+        struct ggml_context * ctx,
+        struct ggml_tensor * a
+)  {
+    GGML_ASSERT(!ggml_is_transposed(a));
+
+    const int64_t ne[4] = {a->ne[0], a->ne[1], a->ne[2], a->ne[3]};
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, ne);
+
+    result->op      = GGML_OP_HADAMARD;
+    result->src[0]  = a;
 
     return result;
 }

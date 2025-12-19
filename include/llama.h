@@ -376,6 +376,9 @@ extern "C" {
         bool swa_full;    // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
                           // NOTE: setting to false when n_seq_max > 1 can cause bad performance in some cases
                           //       ref: https://github.com/ggml-org/llama.cpp/pull/13845#issuecomment-2924800573
+        bool online_R3;
+                          // use online-hadamard transform as mentioned in (https://arxiv.org/pdf/2405.16406)
+                          // Initial value is false and manually activating this option is required (주형 추가)
     };
 
     // model quantization parameters

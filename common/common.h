@@ -346,6 +346,7 @@ struct common_params {
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
+    bool online_R3   = false; //Online에서 R3 Hadamard Transform을 활용하는지
     // multimodal models (see tools/mtmd)
     struct common_params_model mmproj;
     bool mmproj_use_gpu = true;     // use GPU for multimodal model

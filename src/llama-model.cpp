@@ -4735,7 +4735,7 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 struct llm_build_llama : public llm_graph_context {
     llm_build_llama(const llama_model & model, const llm_graph_params & params, ggml_cgraph * gf) : llm_graph_context(params) {
         const int64_t n_embd_head = hparams.n_embd_head_v;
-
+        const bool online_R3     = cparams.online_R3; // R3를 적용하기 위한 Hadamard 연산 
         GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
         GGML_ASSERT(n_embd_head == hparams.n_rot);
 
@@ -4837,6 +4837,12 @@ struct llm_build_llama : public llm_graph_context {
                         ext_factor, attn_factor, beta_fast, beta_slow
                         );
 
+                }
+                
+                if (online_R3)
+                {
+                    Qcur=ggml_hadamard_transform(ctx0,Qcur);
+                    Kcur=ggml_hadamard_transform(ctx0,Kcur);
                 }
                 
                 cb(Qcur, "Qcur", il);

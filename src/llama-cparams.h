@@ -34,6 +34,7 @@ struct llama_cparams {
     bool no_perf;
     bool warmup;
     bool op_offload;
+    bool online_R3; // Hadamard R3 연산을 지원하는지 (주형 추가)
 
     enum llama_pooling_type pooling_type;
 

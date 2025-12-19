@@ -1792,6 +1792,130 @@ static void ggml_compute_forward_mul_mat_id(
     }
 }
 
+// Hadamard 연산을 위한 커널을 구현하는 부분
+static void ggml_compute_forward_hadamard_transform(struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    
+    GGML_ASSERT(ne0 == ne00);
+    GGML_ASSERT(ne1 == ne01);
+    GGML_ASSERT(ne2 == ne02);
+    GGML_ASSERT(ne3 == ne03);
+
+    // we don't support permuted src0
+    GGML_ASSERT(nb00 == ggml_type_size(src0->type));
+
+    // Src0 should be a fp32 type
+    GGML_ASSERT(nb00 == sizeof(float));
+
+    // dst cannot be transposed or permuted
+    GGML_ASSERT(nb0 == sizeof(float));
+    GGML_ASSERT(nb0 <= nb1);
+    GGML_ASSERT(nb1 <= nb2);
+    GGML_ASSERT(nb2 <= nb3);
+
+
+    const size_t row_size = ggml_row_size(src0->type,ne00);
+    const int64_t nr1 = ne1*ne2*ne3;
+
+   
+    // if(ith == 0)
+    // {
+    //     memcpy(dst->data,src0->data,src0_size);
+    // }  
+     
+    if (ith != 0 && nr1 ==1 )
+    {
+        return; 
+    }
+    else
+    {
+        if (ith ==0)
+        {
+            memcpy(dst->data,src0->data,ggml_nbytes(src0));
+            atomic_store_explicit(&params->threadpool->current_chunk, nth, memory_order_relaxed);
+        }
+        ggml_barrier(params->threadpool);
+    }
+    
+    // int chunk_size = 16;
+    
+    // if (ne00 == 1 || nr1 == 1) {
+    //     chunk_size = 64;
+    // }
+    // // printf("online hadamard transform executing\n");
+    // // if (dst->data == NULL)
+    // //     printf("dst->data has been set to NULL\n");
+    // // else 
+    // //     printf("dst->data: %p \n",dst->data);
+
+    // int64_t nchunk0 = (ne00 + chunk_size - 1) / chunk_size;
+    // int64_t nchunk1 = (nr1 + chunk_size -1) / chunk_size;
+
+    // const char *src0_row;
+    
+    int current_chunk = ith;
+    float * dst_row;
+
+    if (ne00 != 0 && ((ne00 & (ne00 - 1)) == 0)) {// Case 1: Power of 2인경우 (R3 rotation을 적용하는 경우)
+        float scale = 1.0f/sqrtf((float) ne00);
+
+        while (current_chunk<nr1)
+        {
+
+            // src0_row=(const char *) src0->data + ((i1)*row_size);
+                dst_row =(float*)((char*)dst->data + (current_chunk)*nb1);
+                int64_t h=1;
+
+                while (h<ne00)
+                {
+                    for (int i2 = 0; i2 < ne00; i2 +=h*2)
+                    {
+                        for(int i3=i2;i3<i2+h;i3++)
+                        {
+                            // float x = *((float*)(src0_row+(i3)*nb00));
+                            // float y = *((float*)(src0_row+(i3+h)*nb00));
+                            float x = dst_row[i3];
+                            float y = dst_row[i3+h];
+
+                            dst_row[i3] = x + y;
+                            dst_row[i3+h] = x - y;
+                        }
+                    }
+
+                    h*=2;
+                    
+                }
+
+            // normalization을 적용하는 부분
+                for (int i=0;i<ne00;i++)
+                {
+                    dst_row[i] *= scale; 
+                }
+       
+            if (nth >= nr1) {
+                break;
+            }
+            current_chunk = atomic_fetch_add_explicit(&params->threadpool->current_chunk, 1, memory_order_relaxed);
+
+        }
+        
+
+
+    }
+    
+    else { // Case 2: Power of 2가 아닌 경우 (R4 Hadamard를 적용하는 경우)
+        printf("Not defined for Fast Hadamard Transform function for vector whose dimension is not a square root of 2\n");
+
+    }
+    // printf("Hadamard Transform finished\n");
+
+
+
+} 
 /////////////////////////////////
 
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
@@ -2141,6 +2265,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_opt_step_adamw(params, tensor);
             }
             break;
+        case GGML_OP_HADAMARD:
+            {
+                ggml_compute_forward_hadamard_transform(params,tensor);
+            }
+            break;
         case GGML_OP_NONE:
             {
                 // nop
@@ -2425,6 +2554,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
+        case GGML_OP_HADAMARD:
             {
                 n_tasks = n_threads;
             } break;
@@ -2827,6 +2957,10 @@ struct ggml_cplan ggml_graph_plan(
                         cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
                         // atomic_current_chunk
                         cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
+                    } break;
+                case GGML_OP_HADAMARD:
+                    {   
+                        cur=ggml_row_size(node->type, node->ne[0])*node->ne[1]*node->ne[2]*node->ne[3];
                     } break;
                 case GGML_OP_OUT_PROD:
                     {

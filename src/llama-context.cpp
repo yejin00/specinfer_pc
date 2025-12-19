@@ -48,6 +48,8 @@ llama_context::llama_context(
     cparams.pooling_type     = params.pooling_type;
     cparams.warmup           = false;
 
+    cparams.online_R3       = params.online_R3; // Online hadamard를 하는 부분을 추가한다 (주형 추가)
+
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
     cparams.rope_freq_scale  = params.rope_freq_scale == 0.0f ? hparams.rope_freq_scale_train : params.rope_freq_scale;

@@ -1158,6 +1158,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
 
+    cparams.online_R3         = params.online_R3;// online x` transform을 llama_context_params에도 설정을 한다 (주형 추가)
+
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
     cparams.type_k_scales_path = params.cache_type_k_scales_path.empty() ? nullptr : params.cache_type_k_scales_path.c_str();
