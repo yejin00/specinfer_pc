@@ -12,6 +12,8 @@
 #include <float.h>
 #include <stdlib.h> // for qsort
 #include <stdio.h>  // for GGML_ASSERT
+#include <time.h>
+
 
 #define GROUP_MAX_EPS 1e-15f
 #define GROUP_MAX_EPS_IQ3_XXS 1e-8f
@@ -92,6 +94,8 @@ void ggml_quantize_q4_0_set_current_layer(int il) {
 
 // NEW: reference implementation with per-block statistics tracking
 void quantize_row_q4_0_ref(const float * GGML_RESTRICT x, block_q4_0 * GGML_RESTRICT y, int64_t k) {
+    struct timespec token_start, token_end;
+    clock_gettime(CLOCK_MONOTONIC, &token_start);
     static const int qk = QK4_0;
 
     assert(k % qk == 0);
@@ -99,9 +103,10 @@ void quantize_row_q4_0_ref(const float * GGML_RESTRICT x, block_q4_0 * GGML_REST
     const int nb = k / qk;
 
     for (int i = 0; i < nb; i++) {
+
         float amax = 0.0f; // absolute max
         float max  = 0.0f;
-        float min  = FLT_MAX;
+        float min  = FLT_MAX; 
         double sum = 0.0;
         double sum_sq = 0.0;
 
@@ -115,24 +120,23 @@ void quantize_row_q4_0_ref(const float * GGML_RESTRICT x, block_q4_0 * GGML_REST
             sum += v;
             sum_sq += v * v;
         }
-
         const float d  = max / -8;
         const float id = d ? 1.0f/d : 0.0f;
 
         y[i].d = GGML_FP32_TO_FP16(d);
         
         // Print per-block statistics (each block = 32 elements)
-        if (q4_0_block_stats.enabled && q4_0_current_layer == 15) {
-            double mean = sum / qk;
-            double variance = (sum_sq / qk) - (mean * mean);
+        // if (q4_0_block_stats.enabled && q4_0_current_layer == 15) {
+        //     double mean = sum / qk;
+        //     double variance = (sum_sq / qk) - (mean * mean);
             
-            // Print every N blocks to avoid too much output
-            if (q4_0_block_stats.block_count % q4_0_block_stats.print_interval == 0) {
-                fprintf(stderr, "[L%02d][Block %6ld] min=% .6f, max=% .6f, mean=% .6f, var=%.6f, scale=% .6f\n",
-                        q4_0_current_layer, q4_0_block_stats.block_count, min, max, mean, variance, d);
-            }
-            q4_0_block_stats.block_count++;
-        }
+        //     // Print every N blocks to avoid too much output
+        //     if (q4_0_block_stats.block_count % q4_0_block_stats.print_interval == 0) {
+        //         fprintf(stderr, "[L%02d][Block %6ld] min=% .6f, max=% .6f, mean=% .6f, var=%.6f, scale=% .6f\n",
+        //                 q4_0_current_layer, q4_0_block_stats.block_count, min, max, mean, variance, d);
+        //     }
+        //     q4_0_block_stats.block_count++;
+        // }
 
         for (int j = 0; j < qk/2; ++j) {
             const float x0 = x[i*qk + 0    + j]*id;
@@ -145,6 +149,16 @@ void quantize_row_q4_0_ref(const float * GGML_RESTRICT x, block_q4_0 * GGML_REST
             y[i].qs[j] |= xi1 << 4;
         }
     }
+    
+    clock_gettime(CLOCK_MONOTONIC, &token_end);
+    double token_time_us = (token_end.tv_sec - token_start.tv_sec) * 1000000.0 +
+                           (token_end.tv_nsec - token_start.tv_nsec) / 1000.0;
+    
+    // Only print for significant quantizations (more than 1 block)
+    // if (nb > 1) {
+    //     fprintf(stderr, "[Q4_0 Quant Timing] Layer %d: %.3f us (%d blocks = %ld elements)\n", 
+    //             q4_0_current_layer, token_time_us, nb, k);
+    // }
 }
 
 void quantize_row_q4_1_ref(const float * GGML_RESTRICT x, block_q4_1 * GGML_RESTRICT y, int64_t k) {
@@ -353,6 +367,52 @@ void dequantize_row_q4_0(const block_q4_0 * GGML_RESTRICT x, float * GGML_RESTRI
         }
     }
 }
+void dequantize_q4_0_pc(const void* src, float* dst, int n_dims, int n_tokens) {
+    fprintf(stderr, "[DEQUANT-Q4_0_PC] Start: dims=%d, tokens=%d\n", n_dims, n_tokens);
+    
+    const size_t scales_size = n_dims * sizeof(ggml_fp16_t);
+    
+    const ggml_fp16_t* scales = (const ggml_fp16_t*)src;
+    const uint8_t* data = (const uint8_t*)((const char*)src + scales_size);
+    
+    // 스케일 샘플 로깅
+    fprintf(stderr, "[DEQUANT-Q4_0_PC] Scales sample: %.4f, %.4f, %.4f\n", 
+           GGML_FP16_TO_FP32(scales[0]), 
+           GGML_FP16_TO_FP32(scales[1]), 
+           GGML_FP16_TO_FP32(scales[2]));
+    
+    for (int t = 0; t < n_tokens; t++) {
+        for (int d = 0; d < n_dims; d++) {
+            float scale = GGML_FP16_TO_FP32(scales[d]);
+            
+            // Unpack 4-bit
+            int data_idx = t * n_dims + d;
+            int byte_idx = data_idx / 2;
+            int nibble = data_idx % 2;
+            
+            int8_t q;
+            if (nibble == 0) {
+                q = (int8_t)(data[byte_idx] & 0x0F);
+            } else {
+                q = (int8_t)((data[byte_idx] >> 4) & 0x0F);
+            }
+            
+            // Sign extend 4-bit to 8-bit
+            if (q & 0x08) {
+                q |= 0xF0;
+            }
+            
+            dst[t * n_dims + d] = scale * (float)q;
+        }
+    }
+    
+    // 결과 샘플 로깅
+    fprintf(stderr, "[DEQUANT-Q4_0_PC] Result sample: %.4f, %.4f, %.4f\n", 
+           dst[0], dst[1], dst[2]);
+    
+    fprintf(stderr, "[DEQUANT-Q4_0_PC] End\n");
+}
+
 
 void dequantize_row_q4_1(const block_q4_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK4_1;

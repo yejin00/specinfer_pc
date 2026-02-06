@@ -17,8 +17,8 @@
 
 // Q4_0_PC Global Definitions
 float ** g_q4_0_pc_scales = NULL;
-void  * g_q4_0_pc_base_addrs[128] = {NULL}; // Base pointers for each layer
-size_t   g_q4_0_pc_row_sizes[128] = {0};    // Row size (bytes per token) for each layer
+void  * g_q4_0_pc_base_addrs[32] = {NULL}; // Base pointers for each layer
+size_t   g_q4_0_pc_row_sizes[32] = {0};    // Row size (bytes per token) for each layer
 int      g_q4_0_pc_cur_layer = 0;
 int      g_q4_0_pc_loaded = 0;
 
@@ -27,13 +27,13 @@ void ggml_q4_0_pc_set_layer(int layer) {
 }
 
 void ggml_q4_0_pc_set_base_addr(int layer, void * addr) {
-    if (layer >= 0 && layer < 128) {
+    if (layer >= 0 && layer < 32) {
         g_q4_0_pc_base_addrs[layer] = addr;
     }
 }
 
 void ggml_q4_0_pc_set_row_size(int layer, size_t size) {
-    if (layer >= 0 && layer < 128) {
+    if (layer >= 0 && layer < 32) {
         g_q4_0_pc_row_sizes[layer] = size;
     }
 }
@@ -1311,12 +1311,17 @@ static void ggml_compute_forward_mul_mat(
     // 레이어번호 
     if (src0->type == GGML_TYPE_Q4_0_PC) {
         int layer_idx = -1;
-        // Expected formats: "q4_0_pc_op_L%d" or "cache_k_l%d"
+        // Expected formats: "q4_0_pc_op_L%d" or "cache_k_l%d" or "Kcur-%d"
         const char * p = strstr(src0->name, "_L"); // Try _L first
         if (!p) p = strstr(src0->name, "_l");      // Try _l next
+        if (!p) p = strstr(src0->name, "Kcur-");    // Try Kcur- (permuted)
         
         if (p) {
-            layer_idx = atoi(p + 2);
+            if (p[0] == 'K') {
+                layer_idx = atoi(p + 5);
+            } else {
+                layer_idx = atoi(p + 2);
+            }
         }
 
         if (layer_idx >= 0) {

@@ -127,7 +127,15 @@ def convert_pkl_to_scales(pkl_path, output_path, no_reduce=False, layer_index=No
             # Aggregate across all layers
             amax_list = []
             debug_first = True
-            for k in sorted(data.keys()):
+            
+            # Sort keys by layer index (integer) to match C loader order (0, 1, 2...)
+            def _get_layer_idx(k):
+                try:
+                    return int(k.split('.')[2])
+                except:
+                    return 99999
+
+            for k in sorted(data.keys(), key=_get_layer_idx):
                 entry = data[k]
                 if debug_first:
                     print(f"DEBUG: First layer '{k}' entry type={type(entry)}")
@@ -150,7 +158,8 @@ def convert_pkl_to_scales(pkl_path, output_path, no_reduce=False, layer_index=No
             if not amax_list:
                 print("Error: No valid per-layer min/max entries found")
                 return False
-            amax = np.max(np.stack(amax_list, axis=0), axis=0)
+            # amax = np.max(np.stack(amax_list, axis=0), axis=0)
+            amax = np.concatenate(amax_list, axis=0)
             amax = np.asarray(amax, dtype=np.float32).reshape(-1)
             print(f"Aggregated across {len(amax_list)} layers using max")
     else:
@@ -161,17 +170,18 @@ def convert_pkl_to_scales(pkl_path, output_path, no_reduce=False, layer_index=No
     print(f"n_channels (before optional reduction): {n_channels}")
 
     # Optional reduction to head_dim=128 if applicable
-    if not no_reduce:
-        amax_reduced = _reduce_to_head_dim(amax, head_dim=128)
-        if amax_reduced.shape[0] != amax.shape[0]:
-            print(f"Reduced from model dim {amax.shape[0]} to head_dim {amax_reduced.shape[0]} via mean across groups")
-            amax = amax_reduced
+    # if not no_reduce:
+    #     amax_reduced = _reduce_to_head_dim(amax, head_dim=128)
+    #     if amax_reduced.shape[0] != amax.shape[0]:
+    #         print(f"Reduced from model dim {amax.shape[0]} to head_dim {amax_reduced.shape[0]} via mean across groups")
+    #         amax = amax_reduced
     n_channels = int(amax.shape[0])
     print(f"Final number of channels: {n_channels}")
 
-    # Calculate per-channel scales: scale = amax / 8
+    # Calculate per-channel scales: scale = amax / 7 (not 8, to prevent positive clipping)
+    # llama.cpp q4_0 range is [-8, +7], so positive max = 7*scale
     amax = np.asarray(amax, dtype=np.float32)
-    scales = amax / 8.0
+    scales = amax / 7.0
     
     # Handle zero scales
     zero_mask = (amax == 0)

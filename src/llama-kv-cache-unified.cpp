@@ -12,8 +12,10 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <stdexcept>
 #include <vector>
 
@@ -57,6 +59,712 @@ struct Q4_0_PC_Params {
     const char * scales_path;
 };
 
+// min/max 값 추출 
+struct KCUR_Stats_Params {
+    int64_t n_dims;
+    int64_t n_tokens;
+    uint32_t head_cur;
+    int layer_idx;
+};
+
+static std::vector<float> g_kcur_min;
+static std::vector<float> g_kcur_max;
+static std::vector<std::mutex> g_kcur_mtx;
+static int64_t g_kcur_layers = 0;
+static int64_t g_kcur_dims   = 0;
+static const char * g_kcur_minmax_path = nullptr;
+static bool g_kcur_minmax_inited = false;
+static bool g_kcur_debug_enabled = false;
+
+// ============================================================================
+// RoPE distribution analysis: pre-RoPE vs post-RoPE K distribution comparison
+// ============================================================================
+// Environment variables:
+//   ROPE_DIST_PATH     - output file path (e.g., /tmp/rope_dist.bin)
+//   ROPE_DIST_LAYERS   - number of layers to track (default: model's n_layer)
+//   ROPE_DIST_TOKENS   - max tokens to collect (default: 2048)
+//
+// Output format: binary file with header + per-channel statistics
+// ============================================================================
+
+// struct rope_dist_stats {
+//     float pre_min;
+//     float pre_max;
+//     float pre_sum;
+//     float pre_sum_sq;
+//     float post_min;
+//     float post_max;
+//     float post_sum;
+//     float post_sum_sq;
+//     int64_t count;
+// };
+
+// static std::vector<rope_dist_stats> g_rope_dist;  // [layer * n_heads * head_dim + head * head_dim + dim]
+// static std::vector<std::mutex> g_rope_dist_mtx;
+// static int64_t g_rope_dist_layers = 0;
+// static int64_t g_rope_dist_heads = 0;
+// static int64_t g_rope_dist_dims = 0;
+// static int64_t g_rope_dist_max_tokens = 2048;
+// static int64_t g_rope_dist_token_count = 0;
+// static const char * g_rope_dist_path = nullptr;
+// static bool g_rope_dist_inited = false;
+// static bool g_rope_dist_enabled = false;
+
+// static void rope_dist_dump() {
+//     if (!g_rope_dist_enabled || !g_rope_dist_path) {
+//         return;
+//     }
+
+//     FILE * fp = fopen(g_rope_dist_path, "wb");
+//     if (!fp) {
+//         fprintf(stderr, "rope_dist_dump: failed to open %s\n", g_rope_dist_path);
+//         return;
+//     }
+
+//     const uint32_t magic = 0x524F5044; // 'ROPD'
+//     const uint32_t version = 2;  // v2: per-head stats
+//     const uint32_t layers = (uint32_t) g_rope_dist_layers;
+//     const uint32_t heads = (uint32_t) g_rope_dist_heads;
+//     const uint32_t dims = (uint32_t) g_rope_dist_dims;
+//     const uint32_t tokens = (uint32_t) g_rope_dist_token_count;
+
+//     fwrite(&magic,   sizeof(magic),   1, fp);
+//     fwrite(&version, sizeof(version), 1, fp);
+//     fwrite(&layers,  sizeof(layers),  1, fp);
+//     fwrite(&heads,   sizeof(heads),   1, fp);
+//     fwrite(&dims,    sizeof(dims),    1, fp);
+//     fwrite(&tokens,  sizeof(tokens),  1, fp);
+
+//     // Write stats: 9 floats per (layer, dim) pair
+//     for (size_t i = 0; i < g_rope_dist.size(); ++i) {
+//         const auto & s = g_rope_dist[i];
+//         fwrite(&s.pre_min,    sizeof(float), 1, fp);
+//         fwrite(&s.pre_max,    sizeof(float), 1, fp);
+//         fwrite(&s.pre_sum,    sizeof(float), 1, fp);
+//         fwrite(&s.pre_sum_sq, sizeof(float), 1, fp);
+//         fwrite(&s.post_min,   sizeof(float), 1, fp);
+//         fwrite(&s.post_max,   sizeof(float), 1, fp);
+//         fwrite(&s.post_sum,   sizeof(float), 1, fp);
+//         fwrite(&s.post_sum_sq,sizeof(float), 1, fp);
+//         float cnt = (float) s.count;
+//         fwrite(&cnt,          sizeof(float), 1, fp);
+//     }
+
+//     fclose(fp);
+//     fprintf(stderr, "rope_dist_dump: saved to %s (layers=%d, heads=%d, dims=%d, tokens=%d)\n",
+//             g_rope_dist_path, layers, heads, dims, tokens);
+// }
+
+// struct rope_dist_values {
+//     std::vector<float> pre_values;   // [token * head * dim]
+//     std::vector<float> post_values;  // [token * head * dim]
+// };
+
+// static std::vector<rope_dist_values> g_rope_dist_values;  // [layer]
+// static std::vector<std::mutex> g_rope_dist_values_mtx;
+// static bool g_rope_dist_collect_values = false;
+// static const char * g_rope_dist_values_path = nullptr;
+
+// static void rope_dist_dump_values() {
+//     if (!g_rope_dist_collect_values || !g_rope_dist_values_path) {
+//         return;
+//     }
+
+//     FILE * fp = fopen(g_rope_dist_values_path, "wb");
+//     if (!fp) {
+//         fprintf(stderr, "rope_dist_dump_values: failed to open %s\n", g_rope_dist_values_path);
+//         return;
+//     }
+
+//     const uint32_t magic = 0x524F5056;
+//     const uint32_t version = 1;
+//     const uint32_t layers = (uint32_t) g_rope_dist_layers;
+//     const uint32_t heads = (uint32_t) g_rope_dist_heads;
+//     const uint32_t dims = (uint32_t) g_rope_dist_dims;
+//     const uint32_t tokens = (uint32_t) g_rope_dist_token_count;
+
+//     fwrite(&magic,   sizeof(magic),   1, fp);
+//     fwrite(&version, sizeof(version), 1, fp);
+//     fwrite(&layers,  sizeof(layers),  1, fp);
+//     fwrite(&heads,   sizeof(heads),   1, fp);
+//     fwrite(&dims,    sizeof(dims),    1, fp);
+//     fwrite(&tokens,  sizeof(tokens),  1, fp);
+
+//     // Write actual values for each layer
+//     for (size_t layer = 0; layer < g_rope_dist_values.size(); ++layer) {
+//         const auto & v = g_rope_dist_values[layer];
+        
+//         // Write pre-RoPE values
+//         uint32_t pre_count = (uint32_t) v.pre_values.size();
+//         fwrite(&pre_count, sizeof(uint32_t), 1, fp);
+//         if (pre_count > 0) {
+//             fwrite(v.pre_values.data(), sizeof(float), pre_count, fp);
+//         }
+        
+//         // Write post-RoPE values
+//         uint32_t post_count = (uint32_t) v.post_values.size();
+//         fwrite(&post_count, sizeof(uint32_t), 1, fp);
+//         if (post_count > 0) {
+//             fwrite(v.post_values.data(), sizeof(float), post_count, fp);
+//         }
+//     }
+
+//     fclose(fp);
+//     fprintf(stderr, "rope_dist_dump_values: saved to %s (layers=%d, heads=%d, dims=%d, tokens=%d)\n",
+//             g_rope_dist_values_path, layers, heads, dims, tokens);
+// }
+
+
+
+// void rope_dist_init_if_needed(int64_t n_layers, int64_t n_heads, int64_t head_dim) {
+//     if (g_rope_dist_inited) {
+//         return;
+//     }
+//     g_rope_dist_inited = true;
+
+//     const char * path = getenv("ROPE_DIST_PATH");
+//     if (!path || path[0] == '\0') {
+//         return;
+//     }
+
+//     int64_t layers = n_layers;
+//     int64_t heads = n_heads;
+//     int64_t dims = head_dim;
+
+//     const char * s_layers = getenv("ROPE_DIST_LAYERS");
+//     const char * s_tokens = getenv("ROPE_DIST_TOKENS");
+//     if (s_layers && s_layers[0]) {
+//         layers = atoll(s_layers);
+//     }
+//     if (s_tokens && s_tokens[0]) {
+//         g_rope_dist_max_tokens = atoll(s_tokens);
+//     }
+
+//     if (layers <= 0 || heads <= 0 || dims <= 0) {
+//         return;
+//     }
+
+//     g_rope_dist_layers = layers;
+//     g_rope_dist_heads = heads;
+//     g_rope_dist_dims = dims;
+//     g_rope_dist_path = path;
+
+//     rope_dist_stats init_stats = {
+//         std::numeric_limits<float>::infinity(),
+//         -std::numeric_limits<float>::infinity(),
+//         0.0f, 0.0f,
+//         std::numeric_limits<float>::infinity(),
+//         -std::numeric_limits<float>::infinity(),
+//         0.0f, 0.0f,
+//         0
+//     };
+//     g_rope_dist.assign((size_t)(layers * heads * dims), init_stats);
+//     g_rope_dist_mtx = std::vector<std::mutex>((size_t)layers);
+
+//     atexit(rope_dist_dump);
+//     g_rope_dist_enabled = true;
+
+//     const char * values_path = getenv("ROPE_DIST_VALUES_PATH");
+//     if (values_path && values_path[0] != '\0') {
+//         g_rope_dist_collect_values = true;
+//         g_rope_dist_values_path = values_path;
+//         g_rope_dist_values.resize(layers);
+//         g_rope_dist_values_mtx = std::vector<std::mutex>((size_t)layers);
+//         atexit(rope_dist_dump_values);
+        
+//         fprintf(stderr, "rope_dist_values: enabled (path=%s)\n", values_path);
+//     }
+
+//     fprintf(stderr, "rope_dist: enabled (path=%s, layers=%ld, heads=%ld, dims=%ld, max_tokens=%ld)\n",
+//             path, (long)layers, (long)heads, (long)dims, (long)g_rope_dist_max_tokens);
+// }
+
+
+// // Called from graph execution to update pre-RoPE stats
+// void rope_dist_update_pre(int layer, const float * data, int64_t n_head, int64_t head_dim, int64_t n_tokens) {
+//     if (!g_rope_dist_enabled || layer < 0 || layer >= g_rope_dist_layers) {
+//         return;
+//     }
+//     if (g_rope_dist_token_count >= g_rope_dist_max_tokens) {
+//         return;
+//     }
+
+//     std::lock_guard<std::mutex> lock(g_rope_dist_mtx[layer]);
+
+//     const int64_t heads_to_track = std::min(n_head, g_rope_dist_heads);
+//     const int64_t dims_to_track = std::min(head_dim, g_rope_dist_dims);
+
+//     for (int64_t t = 0; t < n_tokens && (g_rope_dist_token_count + t) < g_rope_dist_max_tokens; ++t) {
+//         for (int64_t h = 0; h < heads_to_track; ++h) {
+//             for (int64_t d = 0; d < dims_to_track; ++d) {
+//                 float val = data[t * n_head * head_dim + h * head_dim + d];
+//                 // Index: layer * (heads * dims) + head * dims + dim
+//                 size_t idx = (size_t)(layer * g_rope_dist_heads * g_rope_dist_dims + h * g_rope_dist_dims + d);
+//                 auto & s = g_rope_dist[idx];
+//                 s.pre_min = std::min(s.pre_min, val);
+//                 s.pre_max = std::max(s.pre_max, val);
+//                 s.pre_sum += val;
+//                 s.pre_sum_sq += val * val;
+//             }
+//         }
+//     }
+//     if (g_rope_dist_collect_values && layer < (int64_t)g_rope_dist_values.size()) {
+//         std::lock_guard<std::mutex> lock_values(g_rope_dist_values_mtx[layer]);
+//         auto & v = g_rope_dist_values[layer];
+        
+//         for (int64_t t = 0; t < n_tokens && (g_rope_dist_token_count + t) < g_rope_dist_max_tokens; ++t) {
+//             for (int64_t h = 0; h < heads_to_track; ++h) {
+//                 for (int64_t d = 0; d < dims_to_track; ++d) {
+//                     float val = data[t * n_head * head_dim + h * head_dim + d];
+//                     v.pre_values.push_back(val);
+//                 }
+//             }
+//         }
+//     }
+// }
+
+// // Called from graph execution to update post-RoPE stats
+// void rope_dist_update_post(int layer, const float * data, int64_t n_head, int64_t head_dim, int64_t n_tokens) {
+//     if (!g_rope_dist_enabled || layer < 0 || layer >= g_rope_dist_layers) {
+//         return;
+//     }
+//     if (g_rope_dist_token_count >= g_rope_dist_max_tokens) {
+//         return;
+//     }
+
+//     std::lock_guard<std::mutex> lock(g_rope_dist_mtx[layer]);
+
+//     const int64_t heads_to_track = std::min(n_head, g_rope_dist_heads);
+//     const int64_t dims_to_track = std::min(head_dim, g_rope_dist_dims);
+
+//     for (int64_t t = 0; t < n_tokens && (g_rope_dist_token_count + t) < g_rope_dist_max_tokens; ++t) {
+//         for (int64_t h = 0; h < heads_to_track; ++h) {
+//             for (int64_t d = 0; d < dims_to_track; ++d) {
+//                 float val = data[t * n_head * head_dim + h * head_dim + d];
+//                 // Index: layer * (heads * dims) + head * dims + dim
+//                 size_t idx = (size_t)(layer * g_rope_dist_heads * g_rope_dist_dims + h * g_rope_dist_dims + d);
+//                 auto & s = g_rope_dist[idx];
+//                 s.post_min = std::min(s.post_min, val);
+//                 s.post_max = std::max(s.post_max, val);
+//                 s.post_sum += val;
+//                 s.post_sum_sq += val * val;
+//                 s.count++;
+//             }
+//         }
+//     }
+//     if (g_rope_dist_collect_values && layer < (int64_t)g_rope_dist_values.size()) {
+//         std::lock_guard<std::mutex> lock_values(g_rope_dist_values_mtx[layer]);
+//         auto & v = g_rope_dist_values[layer];
+        
+//         for (int64_t t = 0; t < n_tokens && (g_rope_dist_token_count + t) < g_rope_dist_max_tokens; ++t) {
+//             for (int64_t h = 0; h < heads_to_track; ++h) {
+//                 for (int64_t d = 0; d < dims_to_track; ++d) {
+//                     float val = data[t * n_head * head_dim + h * head_dim + d];
+//                     v.post_values.push_back(val);
+//                 }
+//             }
+//         }
+//     }
+// }
+
+// void rope_dist_advance_tokens(int64_t n_tokens) {
+//     if (g_rope_dist_enabled) {
+//         g_rope_dist_token_count += n_tokens;
+//     }
+// }
+
+//여기서부터 (from llama-kv-cache.cpp)
+struct rope_dist_stats {
+    float pre_min;
+    float pre_max;
+    float pre_sum;
+    float pre_sum_sq;
+    float post_min;
+    float post_max;
+    float post_sum;
+    float post_sum_sq;
+    int64_t count;
+};
+
+static std::vector<rope_dist_stats> g_rope_dist;  // [layer * n_heads * head_dim + head * head_dim + dim]
+static std::vector<std::mutex> g_rope_dist_mtx;
+static int64_t g_rope_dist_layers = 0;
+static int64_t g_rope_dist_heads = 0;
+static int64_t g_rope_dist_dims = 0;
+static int64_t g_rope_dist_max_tokens = 2048;
+static int64_t g_rope_dist_token_count = 0;
+static const char * g_rope_dist_path = nullptr;
+static bool g_rope_dist_inited = false;
+static bool g_rope_dist_enabled = false;
+
+static void rope_dist_dump() {
+    if (!g_rope_dist_enabled || !g_rope_dist_path) {
+        return;
+    }
+
+    FILE * fp = fopen(g_rope_dist_path, "wb");
+    if (!fp) {
+        fprintf(stderr, "rope_dist_dump: failed to open %s\n", g_rope_dist_path);
+        return;
+    }
+
+    const uint32_t magic = 0x524F5044; // 'ROPD'
+    const uint32_t version = 2;  // v2: per-head stats
+    const uint32_t layers = (uint32_t) g_rope_dist_layers;
+    const uint32_t heads = (uint32_t) g_rope_dist_heads;
+    const uint32_t dims = (uint32_t) g_rope_dist_dims;
+    const uint32_t tokens = (uint32_t) g_rope_dist_token_count;
+
+    fwrite(&magic,   sizeof(magic),   1, fp);
+    fwrite(&version, sizeof(version), 1, fp);
+    fwrite(&layers,  sizeof(layers),  1, fp);
+    fwrite(&heads,   sizeof(heads),   1, fp);
+    fwrite(&dims,    sizeof(dims),    1, fp);
+    fwrite(&tokens,  sizeof(tokens),  1, fp);
+
+    // Write stats: 9 floats per (layer, dim) pair
+    for (size_t i = 0; i < g_rope_dist.size(); ++i) {
+        const auto & s = g_rope_dist[i];
+        fwrite(&s.pre_min,    sizeof(float), 1, fp);
+        fwrite(&s.pre_max,    sizeof(float), 1, fp);
+        fwrite(&s.pre_sum,    sizeof(float), 1, fp);
+        fwrite(&s.pre_sum_sq, sizeof(float), 1, fp);
+        fwrite(&s.post_min,   sizeof(float), 1, fp);
+        fwrite(&s.post_max,   sizeof(float), 1, fp);
+        fwrite(&s.post_sum,   sizeof(float), 1, fp);
+        fwrite(&s.post_sum_sq,sizeof(float), 1, fp);
+        float cnt = (float) s.count;
+        fwrite(&cnt,          sizeof(float), 1, fp);
+    }
+
+    fclose(fp);
+    fprintf(stderr, "rope_dist_dump: saved to %s (layers=%d, heads=%d, dims=%d, tokens=%d)\n",
+            g_rope_dist_path, layers, heads, dims, tokens);
+}
+
+struct rope_dist_values {
+    std::vector<float> pre_values;   // [token * head * dim]
+    std::vector<float> post_values;  // [token * head * dim]
+};
+
+static std::vector<rope_dist_values> g_rope_dist_values;  // [layer]
+static std::vector<std::mutex> g_rope_dist_values_mtx;
+static bool g_rope_dist_collect_values = false;
+static const char * g_rope_dist_values_path = nullptr;
+
+static void rope_dist_dump_values() {
+    if (!g_rope_dist_collect_values || !g_rope_dist_values_path) {
+        return;
+    }
+
+    FILE * fp = fopen(g_rope_dist_values_path, "wb");
+    if (!fp) {
+        fprintf(stderr, "rope_dist_dump_values: failed to open %s\n", g_rope_dist_values_path);
+        return;
+    }
+
+    const uint32_t magic = 0x524F5056;
+    const uint32_t version = 1;
+    const uint32_t layers = (uint32_t) g_rope_dist_layers;
+    const uint32_t heads = (uint32_t) g_rope_dist_heads;
+    const uint32_t dims = (uint32_t) g_rope_dist_dims;
+    const uint32_t tokens = (uint32_t) g_rope_dist_token_count;
+
+    fwrite(&magic,   sizeof(magic),   1, fp);
+    fwrite(&version, sizeof(version), 1, fp);
+    fwrite(&layers,  sizeof(layers),  1, fp);
+    fwrite(&heads,   sizeof(heads),   1, fp);
+    fwrite(&dims,    sizeof(dims),    1, fp);
+    fwrite(&tokens,  sizeof(tokens),  1, fp);
+
+    // Write actual values for each layer
+    for (size_t layer = 0; layer < g_rope_dist_values.size(); ++layer) {
+        const auto & v = g_rope_dist_values[layer];
+        
+        // Write pre-RoPE values
+        uint32_t pre_count = (uint32_t) v.pre_values.size();
+        fwrite(&pre_count, sizeof(uint32_t), 1, fp);
+        if (pre_count > 0) {
+            fwrite(v.pre_values.data(), sizeof(float), pre_count, fp);
+        }
+        
+        // Write post-RoPE values
+        uint32_t post_count = (uint32_t) v.post_values.size();
+        fwrite(&post_count, sizeof(uint32_t), 1, fp);
+        if (post_count > 0) {
+            fwrite(v.post_values.data(), sizeof(float), post_count, fp);
+        }
+    }
+
+    fclose(fp);
+    fprintf(stderr, "rope_dist_dump_values: saved to %s (layers=%d, heads=%d, dims=%d, tokens=%d)\n",
+            g_rope_dist_values_path, layers, heads, dims, tokens);
+}
+
+
+
+void rope_dist_init_if_needed(int64_t n_layers, int64_t n_heads, int64_t head_dim) {
+    if (g_rope_dist_inited) {
+        return;
+    }
+    g_rope_dist_inited = true;
+
+    const char * path = getenv("ROPE_DIST_PATH");
+    const char * values_path = getenv("ROPE_DIST_VALUES_PATH");
+    
+    // 둘 다 없으면 early return
+    bool has_dist_path = (path && path[0] != '\0');
+    bool has_values_path = (values_path && values_path[0] != '\0');
+    if (!has_dist_path && !has_values_path) {
+        return;
+    }
+
+    int64_t layers = n_layers;
+    int64_t heads = n_heads;
+    int64_t dims = head_dim;
+
+    const char * s_layers = getenv("ROPE_DIST_LAYERS");
+    const char * s_tokens = getenv("ROPE_DIST_TOKENS");
+    if (s_layers && s_layers[0]) {
+        layers = atoll(s_layers);
+    }
+    if (s_tokens && s_tokens[0]) {
+        g_rope_dist_max_tokens = atoll(s_tokens);
+    }
+
+    if (layers <= 0 || heads <= 0 || dims <= 0) {
+        return;
+    }
+
+    g_rope_dist_layers = layers;
+    g_rope_dist_heads = heads;
+    g_rope_dist_dims = dims;
+
+    // ROPE_DIST_PATH가 있으면 통계 수집 활성화
+    if (has_dist_path) {
+        g_rope_dist_path = path;
+
+        rope_dist_stats init_stats = {
+            std::numeric_limits<float>::infinity(),
+            -std::numeric_limits<float>::infinity(),
+            0.0f, 0.0f,
+            std::numeric_limits<float>::infinity(),
+            -std::numeric_limits<float>::infinity(),
+            0.0f, 0.0f,
+            0
+        };
+        g_rope_dist.assign((size_t)(layers * heads * dims), init_stats);
+        
+        // mutex는 항상 초기화 (values만 사용할 때도 안전하게)
+        if (g_rope_dist_mtx.empty()) {
+            g_rope_dist_mtx = std::vector<std::mutex>((size_t)layers);
+        }
+
+        atexit(rope_dist_dump);
+        g_rope_dist_enabled = true;
+
+        fprintf(stderr, "rope_dist: enabled (path=%s, layers=%ld, heads=%ld, dims=%ld, max_tokens=%ld)\n",
+                path, (long)layers, (long)heads, (long)dims, (long)g_rope_dist_max_tokens);
+    }
+
+    // ROPE_DIST_VALUES_PATH가 있으면 값 수집 활성화
+    if (has_values_path) {
+        g_rope_dist_collect_values = true;
+        g_rope_dist_values_path = values_path;
+        g_rope_dist_values.resize(layers);
+        
+        // mutex 초기화 (dist가 없을 때도 필요)
+        if (g_rope_dist_values_mtx.empty()) {
+            g_rope_dist_values_mtx = std::vector<std::mutex>((size_t)layers);
+        }
+        
+        atexit(rope_dist_dump_values);
+        
+        fprintf(stderr, "rope_dist_values: enabled (path=%s, layers=%ld, heads=%ld, dims=%ld, max_tokens=%ld)\n", 
+                values_path, (long)layers, (long)heads, (long)dims, (long)g_rope_dist_max_tokens);
+    }
+}
+
+
+// Called from graph execution to update pre-RoPE stats
+void rope_dist_update_pre(int layer, const float * data, int64_t n_head, int64_t head_dim, int64_t n_tokens) {
+    // 둘 다 비활성화면 early return
+    if (!g_rope_dist_enabled && !g_rope_dist_collect_values) {
+        return;
+    }
+    if (layer < 0 || layer >= g_rope_dist_layers) {
+        return;
+    }
+    if (g_rope_dist_token_count >= g_rope_dist_max_tokens) {
+        return;
+    }
+
+    const int64_t heads_to_track = std::min(n_head, g_rope_dist_heads);
+    const int64_t dims_to_track = std::min(head_dim, g_rope_dist_dims);
+
+    // 통계 수집 (ROPE_DIST_PATH가 설정된 경우)
+    if (g_rope_dist_enabled) {
+        std::lock_guard<std::mutex> lock(g_rope_dist_mtx[layer]);
+        for (int64_t t = 0; t < n_tokens && (g_rope_dist_token_count + t) < g_rope_dist_max_tokens; ++t) {
+            for (int64_t h = 0; h < heads_to_track; ++h) {
+                for (int64_t d = 0; d < dims_to_track; ++d) {
+                    float val = data[t * n_head * head_dim + h * head_dim + d];
+                    size_t idx = (size_t)(layer * g_rope_dist_heads * g_rope_dist_dims + h * g_rope_dist_dims + d);
+                    auto & s = g_rope_dist[idx];
+                    s.pre_min = std::min(s.pre_min, val);
+                    s.pre_max = std::max(s.pre_max, val);
+                    s.pre_sum += val;
+                    s.pre_sum_sq += val * val;
+                    // count는 post에서만 증가
+                }
+            }
+        }
+    }
+
+    // 값 수집 (ROPE_DIST_VALUES_PATH가 설정된 경우)
+    if (g_rope_dist_collect_values && layer < (int64_t)g_rope_dist_values.size()) {
+        std::lock_guard<std::mutex> lock_values(g_rope_dist_values_mtx[layer]);
+        auto & v = g_rope_dist_values[layer];
+        
+        for (int64_t t = 0; t < n_tokens && (g_rope_dist_token_count + t) < g_rope_dist_max_tokens; ++t) {
+            for (int64_t h = 0; h < heads_to_track; ++h) {
+                for (int64_t d = 0; d < dims_to_track; ++d) {
+                    float val = data[t * n_head * head_dim + h * head_dim + d];
+                    v.pre_values.push_back(val);
+                }
+            }
+        }
+    }
+}
+
+// Called from graph execution to update post-RoPE stats
+void rope_dist_update_post(int layer, const float * data, int64_t n_head, int64_t head_dim, int64_t n_tokens) {
+    // 둘 다 비활성화면 early return
+    if (!g_rope_dist_enabled && !g_rope_dist_collect_values) {
+        return;
+    }
+    if (layer < 0 || layer >= g_rope_dist_layers) {
+        return;
+    }
+    if (g_rope_dist_token_count >= g_rope_dist_max_tokens) {
+        return;
+    }
+
+    const int64_t heads_to_track = std::min(n_head, g_rope_dist_heads);
+    const int64_t dims_to_track = std::min(head_dim, g_rope_dist_dims);
+
+    // 통계 수집 (ROPE_DIST_PATH가 설정된 경우)
+    if (g_rope_dist_enabled) {
+        std::lock_guard<std::mutex> lock(g_rope_dist_mtx[layer]);
+        for (int64_t t = 0; t < n_tokens && (g_rope_dist_token_count + t) < g_rope_dist_max_tokens; ++t) {
+            for (int64_t h = 0; h < heads_to_track; ++h) {
+                for (int64_t d = 0; d < dims_to_track; ++d) {
+                    float val = data[t * n_head * head_dim + h * head_dim + d];
+                    size_t idx = (size_t)(layer * g_rope_dist_heads * g_rope_dist_dims + h * g_rope_dist_dims + d);
+                    auto & s = g_rope_dist[idx];
+                    s.post_min = std::min(s.post_min, val);
+                    s.post_max = std::max(s.post_max, val);
+                    s.post_sum += val;
+                    s.post_sum_sq += val * val;
+                    s.count++;
+                }
+            }
+        }
+    }
+
+    // 값 수집 (ROPE_DIST_VALUES_PATH가 설정된 경우)
+    if (g_rope_dist_collect_values && layer < (int64_t)g_rope_dist_values.size()) {
+        std::lock_guard<std::mutex> lock_values(g_rope_dist_values_mtx[layer]);
+        auto & v = g_rope_dist_values[layer];
+        
+        for (int64_t t = 0; t < n_tokens && (g_rope_dist_token_count + t) < g_rope_dist_max_tokens; ++t) {
+            for (int64_t h = 0; h < heads_to_track; ++h) {
+                for (int64_t d = 0; d < dims_to_track; ++d) {
+                    float val = data[t * n_head * head_dim + h * head_dim + d];
+                    v.post_values.push_back(val);
+                }
+            }
+        }
+    }
+}
+
+void rope_dist_advance_tokens(int64_t n_tokens) {
+    if (g_rope_dist_enabled || g_rope_dist_collect_values) {
+        g_rope_dist_token_count += n_tokens;
+    }
+}
+//여기까지
+
+static void kcur_minmax_dump() {
+    if (!g_kcur_minmax_inited || !g_kcur_minmax_path) {
+        return;
+    }
+
+    FILE * fp = fopen(g_kcur_minmax_path, "wb");
+    if (!fp) {
+        return;
+    }
+
+    const uint32_t magic = 0x4b435552; // 'KCUR'
+    const uint32_t version = 1;
+    const uint32_t layers = (uint32_t) g_kcur_layers;
+    const uint32_t dims   = (uint32_t) g_kcur_dims;
+
+    fwrite(&magic,   sizeof(magic),   1, fp);
+    fwrite(&version, sizeof(version), 1, fp);
+    fwrite(&layers,  sizeof(layers),  1, fp);
+    fwrite(&dims,    sizeof(dims),    1, fp);
+
+    fwrite(g_kcur_min.data(), sizeof(float), (size_t)(layers*dims), fp);
+    fwrite(g_kcur_max.data(), sizeof(float), (size_t)(layers*dims), fp);
+
+    fclose(fp);
+}
+
+static void kcur_minmax_init_if_needed(int64_t n_layers, int64_t n_dims) {
+    if (g_kcur_minmax_inited) {
+        return;
+    }
+
+    const char * dbg = getenv("KCUR_DEBUG");
+    g_kcur_debug_enabled = (dbg && dbg[0] != '\0' && strcmp(dbg, "0") != 0);
+
+    const char * path = getenv("KCUR_MINMAX_PATH");
+    if (!path || path[0] == '\0') {
+        g_kcur_minmax_inited = true;
+        return;
+    }
+
+    int64_t layers = n_layers;
+    int64_t dims   = n_dims;
+
+    const char * s_layers = getenv("KCUR_MINMAX_LAYERS");
+    const char * s_dims   = getenv("KCUR_MINMAX_DIMS");
+    if (s_layers && s_layers[0]) {
+        layers = atoll(s_layers);
+    }
+    if (s_dims && s_dims[0]) {
+        dims = atoll(s_dims);
+    }
+
+    if (layers <= 0 || dims <= 0) {
+        g_kcur_minmax_inited = true;
+        return;
+    }
+
+    g_kcur_layers = layers;
+    g_kcur_dims   = dims;
+    g_kcur_minmax_path = path;
+
+    g_kcur_min.assign((size_t)(layers*dims), std::numeric_limits<float>::infinity());
+    g_kcur_max.assign((size_t)(layers*dims), -std::numeric_limits<float>::infinity());
+    g_kcur_mtx = std::vector<std::mutex>((size_t)layers);
+
+    atexit(kcur_minmax_dump);
+
+    g_kcur_minmax_inited = true;
+}
+
 //thread 다 쓰는지 map custom에서 
 // Custom Op: Quantize F32 -> Q4_0_PC (using global shared scales)
 extern "C" void custom_q4_0_pc_op(
@@ -65,14 +773,34 @@ extern "C" void custom_q4_0_pc_op(
     int ith,
     int nth,
     void * userdata
+);
+
+extern "C" void custom_q4_0_pc_op(
+    struct ggml_tensor * dst,
+    const struct ggml_tensor * src,
+    int ith,
+    int nth,
+    void * userdata
 ) {
     Q4_0_PC_Params * params = (Q4_0_PC_Params *)userdata;
+
+#if 0
+    kcur_minmax_init_if_needed(32, params->n_dims);
+#endif
+
+    static bool s_kcur_debug_inited = false;
+    static bool s_kcur_debug_enabled = false;
+    if (!s_kcur_debug_inited) {
+        const char * dbg = getenv("KCUR_DEBUG");
+        s_kcur_debug_enabled = (dbg && dbg[0] != '\0' && strcmp(dbg, "0") != 0);
+        s_kcur_debug_inited = true;
+    }
     
     if (!g_q4_0_pc_loaded && params->scales_path) {
-        load_global_pc_scales(params->scales_path, 128, params->n_dims);
+        load_global_pc_scales(params->scales_path, 32, params->n_dims);
     }
     if (!g_q4_0_pc_scales || params->layer_idx < 0) return;
-    if (params->layer_idx >= 128) return;
+    if (params->layer_idx >= 32) return;
 
     const float * scales = g_q4_0_pc_scales[params->layer_idx];
     if (!scales) return;
@@ -93,25 +821,50 @@ extern "C" void custom_q4_0_pc_op(
 
         int64_t token_idx = params->head_cur + t;
 
-        // [Verification Log] - Print first few dims of Layer 0, first token of the batch
-        // if (params->layer_idx == 0 && t == 0) {
-        //     printf("\n[DEBUG-Q4_0_PC] Quantization Verify (Layer 0, Token %ld):\n", token_idx);
-        //     for (int d = 0; d < 10; d++) { // Check first 10 dims
-        //         float val = src_ptr[d];
-        //         float scale = scales[d];
-        //         float inv = (scale != 0.0f) ? (1.0f / scale) : 0.0f;
-        //         int8_t q = (int8_t)roundf(val * inv);
-        //         q = std::max((int8_t)-8, std::min((int8_t)7, q));
-        //         printf("  Dim %d: Val=%.6f, Scale=%.6f, Q=%d\n", d, val, scale, q);
-        //     }
-        //     // Check a later dim (e.g. 128) to confirm scale changes
-        //     if (n_dims > 128) {
-        //         int d = 128;
-        //         printf("  Dim %d: Val=%.6f, Scale=%.6f\n", d, src_ptr[d], scales[d]);
-        //     }
-        //     printf("---------------------------------------------------\n");
-        // }
 
+        if (g_kcur_minmax_path && params->layer_idx >= 0 && params->layer_idx < g_kcur_layers && n_dims == g_kcur_dims) {
+            std::lock_guard<std::mutex> lock(g_kcur_mtx[(size_t)params->layer_idx]);
+            const size_t base = (size_t)params->layer_idx * (size_t)g_kcur_dims;
+            for (int64_t d = 0; d < n_dims; ++d) {
+                const float v = src_ptr[d];
+                float & mn = g_kcur_min[base + (size_t)d];
+                float & mx = g_kcur_max[base + (size_t)d];
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
+            }
+        }
+
+
+        if (s_kcur_debug_enabled && params->layer_idx == 15 && t == 0) {
+            printf("[KCUR] L15 token_idx=%ld head_cur=%u n_tokens=%ld | v:", token_idx, params->head_cur, n_tokens);
+            for (int d = 0; d < 16; ++d) {
+                printf(" %.6f", src_ptr[d]);
+            }
+            printf(" | s:");
+            for (int d = 0; d < 16; ++d) {
+                printf(" %.6f", scales[d]);
+            }
+            printf(" | q:");
+            for (int d = 0; d < 16; ++d) {
+                const float sd = scales[d]; 
+                const float inv = sd ? (1.0f / sd) : 0.0f;
+                const float xq = src_ptr[d] * inv;
+                const int qi_u = std::min(15, std::max(0, (int)(xq + 8.5f)));
+                const int qi_s = qi_u - 8;
+                printf(" %d", qi_s);
+            }
+            printf(" | dq:");
+            for (int d = 0; d < 16; ++d) {
+                const float sd = scales[d];
+                const float inv = sd ? (1.0f / sd) : 0.0f;
+                const float xq = src_ptr[d] * inv;
+                const int qi_u = std::min(15, std::max(0, (int)(xq + 8.5f)));
+                const int qi_s = qi_u - 8;
+                const float dq = (float) qi_s * sd;
+                printf(" %.6f", dq);
+            }
+            printf("\n");
+        }
         
         char * dst_row_ptr = params->k_data + token_idx * n_blocks_per_token * sizeof(block_q4_0_pc);
         block_q4_0_pc * dst_blocks = (block_q4_0_pc *)dst_row_ptr;
@@ -139,6 +892,48 @@ extern "C" void custom_q4_0_pc_op(
                 dst_blocks[i].qs[j]  = xi0;
                 dst_blocks[i].qs[j] |= xi1 << 4;
             }
+        }
+    }
+}
+
+extern "C" void custom_kcur_stats_passthrough_op(
+    struct ggml_tensor * dst,
+    const struct ggml_tensor * src,
+    int ith,
+    int nth,
+    void * userdata
+) {
+    KCUR_Stats_Params * params = (KCUR_Stats_Params *)userdata;
+
+    kcur_minmax_init_if_needed(32, params->n_dims);
+
+    const float * src_data = (const float *)src->data;
+    float * dst_data = (float *)dst->data;
+
+    const int64_t n_dims = params->n_dims;
+    const int64_t n_tokens = params->n_tokens;
+
+    const int64_t t_start = (n_tokens * ith) / nth;
+    const int64_t t_end   = (n_tokens * (ith + 1)) / nth;
+
+    for (int64_t t = t_start; t < t_end; ++t) {
+        const float * src_ptr = src_data + t * n_dims;
+        float * dst_ptr = dst_data + t * n_dims;
+
+        if (g_kcur_minmax_path && params->layer_idx >= 0 && params->layer_idx < g_kcur_layers && n_dims == g_kcur_dims) {
+            std::lock_guard<std::mutex> lock(g_kcur_mtx[(size_t)params->layer_idx]);
+            const size_t base = (size_t)params->layer_idx * (size_t)g_kcur_dims;
+            for (int64_t d = 0; d < n_dims; ++d) {
+                const float v = src_ptr[d];
+                float & mn = g_kcur_min[base + (size_t)d];
+                float & mx = g_kcur_max[base + (size_t)d];
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
+
+                dst_ptr[d] = v;
+            }
+        } else {
+            memcpy(dst_ptr, src_ptr, (size_t)n_dims * sizeof(float));
         }
     }
 }
@@ -889,6 +1684,8 @@ extern "C" {
     void ggml_quantize_q4_0_set_current_layer(int il);
 }
 
+
+// min/max 값 추출 
 ggml_tensor * llama_kv_cache_unified::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, int32_t il, uint32_t head_cur) const {
     const int32_t ikv = map_layer_ids.at(il);
 
@@ -911,7 +1708,7 @@ ggml_tensor * llama_kv_cache_unified::cpy_k(ggml_context * ctx, ggml_tensor * k_
             (size_t)k->ne[1],
             (char *)k->data,
             //일단 하드코딩으로 이름 지정해서 넣어주는걸로함 --> 추후 수정 
-            "scales_k.bin"
+            "scales_k.bin" 
         };
 
         ggml_tensor * dummy = ggml_map_custom1(ctx, k_cur, custom_q4_0_pc_op, 1, params);
@@ -925,8 +1722,59 @@ ggml_tensor * llama_kv_cache_unified::cpy_k(ggml_context * ctx, ggml_tensor * k_
             n_tokens*hparams.n_embd_k_gqa(il),
             ggml_row_size(k->type, hparams.n_embd_k_gqa(il))*head_cur);
 
-    return ggml_cpy(ctx, k_cur, k_view);
+    {
+        KCUR_Stats_Params * params = new KCUR_Stats_Params{
+            (int64_t)hparams.n_embd_k_gqa(il),
+            (int64_t)n_tokens,
+            head_cur,
+            il,
+        };
+        ggml_tensor * k_stats = ggml_map_custom1(ctx, k_cur, custom_kcur_stats_passthrough_op, 1, params);
+        ggml_format_name(k_stats, "kcur_stats_L%d", il);
+        return ggml_cpy(ctx, k_stats, k_view);
+    }
 }
+
+
+// ggml_tensor * llama_kv_cache_unified::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, int32_t il, uint32_t head_cur) const {
+//     const int32_t ikv = map_layer_ids.at(il);
+
+//     auto * k = layers[ikv].k;
+
+//     const int64_t n_tokens = k_cur->ne[2];
+    
+
+//     // Set layer tag right before quantization
+//     ggml_quantize_q4_0_set_current_layer(il);
+
+//     if (k->type == GGML_TYPE_Q4_0_PC) {
+
+//         // 파라미터 저장 (그래프 실행 때 쓰려고 힙에 할당)
+//         Q4_0_PC_Params * params = new Q4_0_PC_Params{
+//             (int64_t)hparams.n_embd_k_gqa(il),
+//             (int64_t)n_tokens,
+//             head_cur,
+//             il,
+//             (size_t)k->ne[1],
+//             (char *)k->data,
+//             //일단 하드코딩으로 이름 지정해서 넣어주는걸로함 --> 추후 수정 
+//             "scales_k.bin"
+//         };
+
+//         ggml_tensor * dummy = ggml_map_custom1(ctx, k_cur, custom_q4_0_pc_op, 1, params);
+        
+//         ggml_format_name(dummy, "q4_0_pc_op_L%d", il);
+        
+//         return dummy;
+//     }
+
+//     ggml_tensor * k_view = ggml_view_1d(ctx, k,
+//             n_tokens*hparams.n_embd_k_gqa(il),
+//             ggml_row_size(k->type, hparams.n_embd_k_gqa(il))*head_cur);
+
+//     return ggml_cpy(ctx, k_cur, k_view);
+// }
+
 
 ggml_tensor * llama_kv_cache_unified::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, int32_t il, uint32_t head_cur) const {
     const int32_t ikv = map_layer_ids.at(il);

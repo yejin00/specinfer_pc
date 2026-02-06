@@ -1,5 +1,7 @@
 #ifndef GGML_COMMON_DECL
+
 #include <stddef.h>
+
 #if defined(GGML_COMMON_DECL_C)
 #include <stdint.h>
 
@@ -433,8 +435,8 @@ extern "C" {
 #endif
 
 extern float ** g_q4_0_pc_scales;     
-extern void  *  g_q4_0_pc_base_addrs[128];
-extern size_t   g_q4_0_pc_row_sizes[128];
+extern void  *  g_q4_0_pc_base_addrs[32];
+extern size_t   g_q4_0_pc_row_sizes[32];
 extern int      g_q4_0_pc_cur_layer; 
 extern int      g_q4_0_pc_loaded;    
 

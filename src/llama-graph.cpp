@@ -1128,13 +1128,6 @@ ggml_tensor * llm_graph_context::build_attn_mha(
              float     kq_scale) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
-    // Handle Q4_0_PC KV cache - must dequantize BEFORE permute
-    // if (k->type == GGML_TYPE_Q4_0_PC) {
-    //     ggml_tensor * k_f32 = ggml_new_tensor(ctx0, GGML_TYPE_F32, GGML_MAX_DIMS, k->ne);
-    //     ggml_format_name(k_f32, "%s (f32)", k->name);
-    //     k = ggml_cpy(ctx0, k, k_f32);
-    // }
-
     q = ggml_permute(ctx0, q, 0, 2, 1, 3);
     k = ggml_permute(ctx0, k, 0, 2, 1, 3);
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
@@ -1347,12 +1340,16 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_set_output(k_cur);
         ggml_set_output(v_cur);
 
+        //rmsnorm 추가 -예진
+        // k_cur = ggml_rms_norm(ctx0, k_cur);  
+
         ggml_build_forward_expand(gf, kv_state->cpy_k(ctx0, k_cur, il));
         ggml_build_forward_expand(gf, kv_state->cpy_v(ctx0, v_cur, il));
 
         k_cur = kv_state->get_k(ctx0, il);
         v_cur = kv_state->get_v(ctx0, il);
     }
+    
 
     const auto & kq_mask = inp->get_kq_mask();
 

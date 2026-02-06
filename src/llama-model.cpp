@@ -4732,12 +4732,92 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
     return layers[il].rope_short;
 }
 
+// ============================================================================
+// RoPE distribution custom op for collecting pre/post RoPE K values
+// ============================================================================
+struct rope_dist_params {
+    int layer;
+    int64_t n_head;
+    int64_t head_dim;
+    bool is_post;  // true for post-RoPE, false for pre-RoPE
+};
+
+static void rope_dist_custom_op(ggml_tensor * dst, const ggml_tensor * src, int ith, int nth, void * userdata) {
+    (void) dst;  // dst == src for inplace op
+    (void) nth;
+
+    rope_dist_params * params = (rope_dist_params *) userdata;
+    
+    // Only collect stats on thread 0
+    if (ith != 0) {
+        return;
+    }
+
+    // Get dimensions: [head_dim, n_head, n_tokens]
+    const int64_t head_dim = src->ne[0];
+    const int64_t n_head = src->ne[1];
+    const int64_t n_tokens = src->ne[2];
+
+    static int s_dbg_count = 0;
+    if (s_dbg_count++ < 10 && params->layer == 0) {
+        fprintf(stderr, "rope_dist_custom_op: layer=%d, is_post=%d, type=%d, ne=[%ld,%ld,%ld], data=%p\n",
+                params->layer, params->is_post, src->type, (long)head_dim, (long)n_head, (long)n_tokens, src->data);
+        
+        // Print sample values for debugging - use LAST token (higher position) instead of first
+        // Position 0 has no rotation, so we need higher positions to see RoPE effect
+        if (src->type == GGML_TYPE_F32 && n_tokens > 0 && n_head > 0 && head_dim >= 128) {
+            const float * data = (const float *) src->data;
+            int64_t t = n_tokens - 1;  // last token has highest position
+            int64_t offset = t * n_head * head_dim;  // head 0
+            fprintf(stderr, "  [L%d %s] head0 token%ld: dim[0]=%.6f, dim[64]=%.6f, dim[127]=%.6f\n",
+                    params->layer, params->is_post ? "POST" : "PRE ", (long)t,
+                    data[offset + 0], data[offset + 64], data[offset + 127]);
+        } else if (src->type == GGML_TYPE_F16 && n_tokens > 0 && n_head > 0 && head_dim >= 128) {
+            const ggml_fp16_t * data = (const ggml_fp16_t *) src->data;
+            int64_t t = n_tokens - 1;
+            int64_t offset = t * n_head * head_dim;
+            fprintf(stderr, "  [L%d %s] head0 token%ld: dim[0]=%.6f, dim[64]=%.6f, dim[127]=%.6f\n",
+                    params->layer, params->is_post ? "POST" : "PRE ", (long)t,
+                    ggml_fp16_to_fp32(data[offset + 0]), ggml_fp16_to_fp32(data[offset + 64]), ggml_fp16_to_fp32(data[offset + 127]));
+        }
+    }
+
+    // Need F32 data for stats
+    if (src->type == GGML_TYPE_F32) {
+        const float * data = (const float *) src->data;
+        if (params->is_post) {
+            rope_dist_update_post(params->layer, data, n_head, head_dim, n_tokens);
+        } else {
+            rope_dist_update_pre(params->layer, data, n_head, head_dim, n_tokens);
+        }
+    } else if (src->type == GGML_TYPE_F16) {
+        // Convert F16 to F32 for stats
+        std::vector<float> f32_data(ggml_nelements(src));
+        for (int64_t i = 0; i < ggml_nelements(src); i++) {
+            f32_data[i] = ggml_fp16_to_fp32(((const ggml_fp16_t *) src->data)[i]);
+        }
+        if (params->is_post) {
+            rope_dist_update_post(params->layer, f32_data.data(), n_head, head_dim, n_tokens);
+        } else {
+            rope_dist_update_pre(params->layer, f32_data.data(), n_head, head_dim, n_tokens);
+        }
+    }
+
+    // Advance token count after collecting post-RoPE stats for layer 0
+    if (params->is_post && params->layer == 0) {
+        rope_dist_advance_tokens(n_tokens);
+    }
+}
+
 struct llm_build_llama : public llm_graph_context {
     llm_build_llama(const llama_model & model, const llm_graph_params & params, ggml_cgraph * gf) : llm_graph_context(params) {
         const int64_t n_embd_head = hparams.n_embd_head_v;
         const bool online_R3     = cparams.online_R3; // R3를 적용하기 위한 Hadamard 연산 
         GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
         GGML_ASSERT(n_embd_head == hparams.n_rot);
+
+        // Initialize rope distribution tracking if enabled via env var
+        rope_dist_init_if_needed(n_layer, n_head_kv, n_embd_head);
 
         ggml_tensor * cur;
         ggml_tensor * inpL;
@@ -4749,7 +4829,7 @@ struct llm_build_llama : public llm_graph_context {
         auto * inp_attn = build_attn_inp_kv_unified();
 
         const auto * kv_state = static_cast<const llama_kv_cache_unified_state *>(mstate);
-        ggml_tensor * inp_kv;
+        ggml_tensor * inp_kv = nullptr;
         // ggml_tensor * inp_kv = build_inp_k_cache_pos();
         // 현재 Key_cache에 해당하는 
         
@@ -4798,7 +4878,13 @@ struct llm_build_llama : public llm_graph_context {
 
                 if (cparams.pre_rope)
                 {   
-                    
+                    // Collect pre-RoPE K distribution if enabled (before KV cache save)
+                    if (getenv("ROPE_DIST_PATH") || getenv("ROPE_DIST_VALUES_PATH")) {
+                        rope_dist_params * pre_params = new rope_dist_params{il, n_head_kv, n_embd_head, false};
+                        Kcur = ggml_map_custom1_inplace(ctx0, Kcur, rope_dist_custom_op, 1, pre_params);
+                        ggml_format_name(Kcur, "Kcur_pre_rope_L%d", il);
+                    }
+
                     ggml_set_output(Kcur);
                     ggml_set_output(Vcur);
 
@@ -4808,7 +4894,7 @@ struct llm_build_llama : public llm_graph_context {
                     Kcur = kv_state->get_k(ctx0, il);
                     Vcur = kv_state->get_v(ctx0, il);
 
-                    if (il==0)
+                    if (!inp_kv)
                         inp_kv = build_inp_k_cache_pos();
                     
                     Qcur = ggml_rope_ext(
@@ -4822,9 +4908,23 @@ struct llm_build_llama : public llm_graph_context {
                         n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                         ext_factor, attn_factor, beta_fast, beta_slow
                         );
+
+                    // Collect post-RoPE K distribution if enabled (pre_rope path)
+                    if (getenv("ROPE_DIST_PATH") || getenv("ROPE_DIST_VALUES_PATH")) {
+                        rope_dist_params * post_params = new rope_dist_params{il, n_head_kv, n_embd_head, true};
+                        Kcur = ggml_map_custom1_inplace(ctx0, Kcur, rope_dist_custom_op, 1, post_params);
+                        ggml_format_name(Kcur, "Kcur_post_rope_L%d", il);
+                    }
                 }
                 else 
                 {
+                    // Collect pre-RoPE K distribution if enabled (standard path)
+                    if (getenv("ROPE_DIST_PATH") || getenv("ROPE_DIST_VALUES_PATH")) {
+                        rope_dist_params * pre_params = new rope_dist_params{il, n_head_kv, n_embd_head, false};
+                        Kcur = ggml_map_custom1_inplace(ctx0, Kcur, rope_dist_custom_op, 1, pre_params);
+                        ggml_format_name(Kcur, "Kcur_pre_rope_L%d", il);
+                    }
+
                     Qcur = ggml_rope_ext(
                         ctx0, Qcur, inp_pos, rope_factors,
                         n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
@@ -4837,6 +4937,12 @@ struct llm_build_llama : public llm_graph_context {
                         ext_factor, attn_factor, beta_fast, beta_slow
                         );
 
+                    // Collect post-RoPE K distribution if enabled (standard path)
+                    if (getenv("ROPE_DIST_PATH") || getenv("ROPE_DIST_VALUES_PATH")) {
+                        rope_dist_params * post_params = new rope_dist_params{il, n_head_kv, n_embd_head, true};
+                        Kcur = ggml_map_custom1_inplace(ctx0, Kcur, rope_dist_custom_op, 1, post_params);
+                        ggml_format_name(Kcur, "Kcur_post_rope_L%d", il);
+                    }
                 }
                 
                 if (online_R3)

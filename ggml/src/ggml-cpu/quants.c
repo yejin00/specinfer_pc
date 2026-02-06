@@ -144,6 +144,53 @@ void ggml_vec_dot_q4_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     *s = sumf;
 }
 
+// ===================================== Q4_0_PC =====================================
+
+void ggml_vec_dot_q4_0_pc_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const block_q4_0_pc * restrict x = (const block_q4_0_pc *)vx;
+    const block_q8_0    * restrict y = (const block_q8_0    *)vy;
+    
+    // Calculate dimension offset
+    void * base_addr = g_q4_0_pc_base_addrs[g_q4_0_pc_cur_layer];
+    size_t row_size  = g_q4_0_pc_row_sizes[g_q4_0_pc_cur_layer];
+    float * scales   = g_q4_0_pc_scales[g_q4_0_pc_cur_layer];
+    int64_t dim_base = 0;
+    
+    if (base_addr && row_size > 0) {
+        size_t offset_bytes = (const char *)vx - (const char *)base_addr;
+        size_t offset_in_token = offset_bytes % row_size;
+        dim_base = offset_in_token * 2; // 2 elements per byte
+    }
+
+    const int nb = n / 32;
+    float sumf = 0.0f;
+    
+    // Process blocks
+    for (int i = 0; i < nb; i++) {
+        const float d_y = GGML_FP16_TO_FP32(y[i].d);
+
+        for (int j = 0; j < 16; ++j) {
+            // Unpack Q4_0_PC nibbles (same layout as standard Q4_0)
+            uint8_t v = x[i].qs[j];
+            int8_t v0 = (int8_t)(v & 0x0F) - 8;
+            int8_t v1 = (int8_t)(v >> 4) - 8;
+            
+            int dim0 = i * 32 + j;
+            int dim1 = i * 32 + j + 16;
+
+            int8_t y0 = y[i].qs[j];
+            int8_t y1 = y[i].qs[j + 16];
+            
+            float s0 = scales[dim_base + dim0];
+            float s1 = scales[dim_base + dim1];
+
+            sumf += (v0 * y0) * s0 * d_y;
+            sumf += (v1 * y1) * s1 * d_y;
+        }
+    }
+    *s = sumf;
+}
+
 // TODO: add WASM SIMD
 void ggml_vec_dot_q4_1_q8_1_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_1;
@@ -1157,76 +1204,3 @@ void quantize_row_iq4_xs(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, 
     quantize_iq4_xs(x, y, 1, k, NULL);
 }
 
-// ===================================== Q4_0_PC =====================================
-
-void ggml_vec_dot_q4_0_pc_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
-    const block_q4_0_pc * restrict x = (const block_q4_0_pc *)vx;
-    const block_q8_0    * restrict y = (const block_q8_0    *)vy;
-    
-    static int debug_count = 0;
-    bool do_print = (debug_count < 20);
-
-    // Safety check for global scales
-    // if (!g_q4_0_pc_scales || g_q4_0_pc_cur_layer < 0) {
-    //     if (do_print) printf("[VEC_DOT] FAIL: No scales (g_scales=%p) or Invalid Layer (%d)\n", (void*)g_q4_0_pc_scales, g_q4_0_pc_cur_layer);
-    //     *s = 0.0f;
-    //     return;
-    // }
-    // const float * restrict scales = g_q4_0_pc_scales[g_q4_0_pc_cur_layer];
-    // if (!scales) {
-    //     if (do_print) printf("[VEC_DOT] FAIL: Scales for layer %d is NULL\n", g_q4_0_pc_cur_layer);
-    //     *s = 0.0f;
-    //     return;
-    // }
-    
-    // Calculate dimension offset
-    void * base_addr = g_q4_0_pc_base_addrs[g_q4_0_pc_cur_layer];
-    size_t row_size  = g_q4_0_pc_row_sizes[g_q4_0_pc_cur_layer];
-    float * scales   = g_q4_0_pc_scales[g_q4_0_pc_cur_layer];
-    int64_t dim_base = 0;
-    
-    if (base_addr && row_size > 0) {
-        size_t offset_bytes = (const char *)vx - (const char *)base_addr;
-        size_t offset_in_token = offset_bytes % row_size;
-        dim_base = offset_in_token * 2; // 2 elements per byte
-    }
-
-    const int nb = n / 32;
-    float sumf = 0.0f;
-    
-    // Process blocks
-    for (int i = 0; i < nb; i++) {
-        const float d_y = GGML_FP16_TO_FP32(y[i].d);
-
-        for (int j = 0; j < 16; ++j) {
-            // Unpack Q4_0_PC nibbles (same layout as standard Q4_0)
-            uint8_t v = x[i].qs[j];
-            int8_t v0 = (int8_t)(v & 0x0F) - 8;
-            int8_t v1 = (int8_t)(v >> 4) - 8;
-            
-            int dim0 = i * 32 + j;
-            int dim1 = i * 32 + j + 16;
-
-            int8_t y0 = y[i].qs[j];
-            int8_t y1 = y[i].qs[j + 16];
-            
-            float s0 = scales[dim_base + dim0];
-            float s1 = scales[dim_base + dim1];
-
-            sumf += (v0 * y0) * s0 * d_y;
-            sumf += (v1 * y1) * s1 * d_y;
-            
-            if (do_print && i == 0 && j < 2) {
-                printf("[VEC_DOT] L%d B%d J%d | dim_base=%ld | v0=%d y0=%d s0=%.5f dy=%.5f | sum=%.5f\n", 
-                       g_q4_0_pc_cur_layer, i, j, dim_base, v0, y0, s0, d_y, sumf);
-            }
-        }
-    }
-    
-    if (do_print) {
-        printf("[VEC_DOT] Result sumf = %.5f\n", sumf);
-        debug_count++;
-    }
-    
-    *s = sumf;
-}

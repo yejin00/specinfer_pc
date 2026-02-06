@@ -139,7 +139,7 @@ void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
 void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
     const int nb = n / qk;
-    printf("Hi I'm Here\n");
+    // printf("Hi I'm Here\n");
     assert(n % qk == 0);
 #if defined(__ARM_FEATURE_MATMUL_INT8)
     assert((nrc == 2) || (nrc == 1));

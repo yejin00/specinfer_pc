@@ -863,7 +863,6 @@ const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
     return &type_traits[type];
 }
 
-//
 // ggml object
 //
 

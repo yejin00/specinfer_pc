@@ -13,6 +13,12 @@ struct llama_hparams;
 struct llama_model;
 struct llama_context;
 
+// RoPE distribution analysis functions
+void rope_dist_init_if_needed(int64_t n_layers, int64_t n_heads, int64_t head_dim);
+void rope_dist_update_pre(int layer, const float * data, int64_t n_head, int64_t head_dim, int64_t n_tokens);
+void rope_dist_update_post(int layer, const float * data, int64_t n_head, int64_t head_dim, int64_t n_tokens);
+void rope_dist_advance_tokens(int64_t n_tokens);
+
 //
 // llama_kv_cache_unified
 //
